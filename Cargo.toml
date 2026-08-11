@@ -22,6 +22,10 @@ slim-common = { path = "../slimRAG/slim-common" }
 heed = "0.22.1"
 # 管理平面：SQLite
 rusqlite = { version = "0.32", features = ["bundled"] }
+# 传输解密（与 slimSync/e2e-tools 锁文件对齐 0.10）
+chacha20poly1305 = "0.10"
+# 十六进制密钥
+hex = "0.4"
 # CLI 与配置
 clap = { version = "4.6", features = ["derive"] }
 toml = "0.8"

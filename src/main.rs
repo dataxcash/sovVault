@@ -5,6 +5,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 use sov_vault::config::{Config, PathOverrides};
 use sov_vault::db::DbRegistry;
+use sov_vault::ingest::offline::OfflineScanner;
 use sov_vault::ledger::Ledger;
 
 #[derive(Parser)]
@@ -49,8 +50,12 @@ struct Cli {
 enum Command {
     /// 常驻服务：初始化三平面并启动 Ingest（P1 起承载流量）。
     Serve,
-    /// 离线注入：WAL 目录 / PCAP 文件 → 同一 Record 流水线（P1）。
-    Ingest,
+    /// 离线注入：WAL 目录 → 四重校验扫描 → 报告统计（PCAP 输入 P5）。
+    Ingest {
+        /// WAL 目录（缺省用配置的 hot_dir）。
+        #[arg(long)]
+        wal_dir: Option<std::path::PathBuf>,
+    },
     /// 司法级导出 PCAP/Parquet（P5）。
     Export,
     /// 报文查询（P3.5）。
@@ -81,11 +86,49 @@ fn main() -> Result<()> {
 
     match cli.command {
         Command::Serve => cmd_serve(&cfg),
+        Command::Ingest { wal_dir } => cmd_ingest(&cfg, wal_dir),
         other => anyhow::bail!(
-            "子命令 {:?} 尚未在本期（P0）实现，按 09 白皮书阶段推进",
+            "子命令 {:?} 尚未在本期（P1）实现，按 09 白皮书阶段推进",
             other
         ),
     }
+}
+
+/// P1：离线 WAL 注入——扫描目录 → 四重校验解码 → 报告统计与脏尾。
+fn cmd_ingest(cfg: &Config, wal_dir: Option<std::path::PathBuf>) -> Result<()> {
+    let dir = wal_dir.unwrap_or_else(|| cfg.hot_dir());
+    let scanner = OfflineScanner::new(&dir);
+    let scans = scanner.scan_all()?;
+
+    let mut records = 0u64;
+    let mut bytes = 0u64;
+    let mut dirty = 0u64;
+    for s in &scans {
+        records += s.stats.records;
+        bytes += s.stats.payload_bytes;
+        dirty += s.stats.dirty_tail_bytes;
+        let state = if s.stats.dirty_tail_bytes > 0 {
+            "脏尾"
+        } else {
+            "完好"
+        };
+        tracing::info!(
+            "  {}: {} 条 / {}B payload / {}（{}B 脏尾）",
+            s.path.display(),
+            s.stats.records,
+            s.stats.payload_bytes,
+            state,
+            s.stats.dirty_tail_bytes
+        );
+    }
+    tracing::info!(
+        "离线扫描完成：{} 文件 / {} 条记录 / {}B / 脏尾 {}B",
+        scans.len(),
+        records,
+        bytes,
+        dirty
+    );
+    Ok(())
 }
 
 /// P0：三平面初始化验证——建目录 + 开 LMDB（8 DBI）+ 开 SQLite + 打印验收摘要。
