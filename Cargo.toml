@@ -1,0 +1,49 @@
+[package]
+name = "sov-vault"
+version = "0.1.0"
+edition = "2021"
+description = "铁幕·带外零信任主权平台 - 存储中枢 (sovVault)"
+license = "Apache-2.0"
+
+[[bin]]
+name = "sovvault"
+path = "src/main.rs"
+
+[lib]
+name = "sov_vault"
+path = "src/lib.rs"
+
+[dependencies]
+# 工作区依赖（版本与 e2e-tools / slimSync 锁文件对齐）
+sov-probe = { path = "../sovProbe/sovProbe" }
+slim-common = { path = "../slimRAG/slim-common" }
+
+# 索引平面：LMDB（heed 0.22，与 slimRAG 锁文件对齐）
+heed = "0.22.1"
+# 管理平面：SQLite
+rusqlite = { version = "0.32", features = ["bundled"] }
+# CLI 与配置
+clap = { version = "4.6", features = ["derive"] }
+toml = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 错误与日志
+anyhow = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# 字节工具（大端键值编解码）
+byteorder = "1"
+
+[features]
+default = []
+parquet-export = []
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+panic = "abort"
+
+[workspace]
+members = ["."]

@@ -1,6 +1,6 @@
-# sovVault 设计与实施方案（评审稿 v0.3）
+# sovVault 设计与实施方案（评审稿 v0.5）
 
-> 状态：**待评审** | 版本：v0.3 | 所属：IronSovereign 开源底座（datax.cash）
+> 状态：**待评审** | 版本：v0.5 | 所属：IronSovereign 开源底座（datax.cash）
 > 本文档定义存储中枢 **sovVault**：Zenoh 字节流 → 重组解密 → TCP 连接/QR 对匹配 → 分级存储 → 司法级导出与查询。
 >
 > **v0.2 修订（响应评审①）：**
@@ -17,6 +17,12 @@
 > 2. **RST 级联熔断**：RST 帧到达 → 同事务内将该连接全部 PENDING Q 翻转为 `RST_ABORT`，不等待超时。
 > 3. **EXT META 伪 Key 兜底**：无 L7 解码器时以 `[magic_prefix + entropy]` 特征生成伪 Key 入 `DBI_QR_KEY`，私有 Binary 协议同样可追溯。
 > 4. **查询维度矩阵补齐**：新增 `DBI_CONN_QR`（单 CONN 反查）、`DBI_QR_TIME`（全局时间窗）、`DBI_PACKET_QR`（报文 IDX 逆向反查所属 QR）、`DBI_RECORD_TS`（报文时间窗导出），回答"单连接 QRIDX 如何查询"。
+>
+> **v0.5 修订（响应评审④ — L2.5 连接级 OOO 字节预算）：**
+> 1. **L2.5 单连接 OOO 字节硬闸**（`conn_pending_cap_bytes`，默认 16MB）：填补 L1（按 Q 计数）与 L2（按段）之间的连接维度字节预算空洞——恶意连接无法以"单段压在 L2 上限内、横跨大量段"的方式独占全局 L3，也不受全局逐出误伤无辜连接。
+> 2. **逐级响应**：超限先**连接内逐出最旧**（置 `SEQ_GAP` → GapQuery 回源自愈，数据平面照常落盘）；窗口（`conn_evict_window_secs`）内持续耗尽（`conn_evict_threshold` 次）升级**内部检疫**（`CONN_OOO_FLOOD`，语义同 L1）。
+> 3. **L3 升级连接感知逐出**：全局兜底优先清已检疫/标记连接缓存，无辜连接最后碰。
+> 4. **超限"强 RST"明确否决（红线三理由）**：旁路带外被动探针不扰动生产 / RST 可伪造会被恶意者利用成攻击面 / 恶意连接两端皆受控、注入 RST 零收益。
 
 ---
 
@@ -265,22 +271,27 @@ SYN(c→s)         SYN|ACK(s→c)       ACK(c→s)
 
 > **"网络天气"型异常只计数，不逐条落 SQLite（评审③定案）**：DUP/RETRANS/ZERO_WIN 在高压网络中是常态而非致命异常，逐条入库会造成管理平面写放大、反向阻塞 Ingest。它们仅累加进 `DBI_CONN_STATE.anomaly_flags` 与每连接计数器，**连接关闭/RST 时聚合归档一次**——离线 SQL 统计看的是"该连接重传率"，不是"第 3421 个包是否重传"。
 
-### 5.7 资源防御：乱序缓存预算与连接检疫 ★（评审③）
+### 5.7 资源防御：乱序缓存预算与连接检疫 ★（评审③④）
 
-**三层预算，硬上限逐级拦截恶意/病态流量**：
+**四层预算，硬上限逐级拦截恶意/病态流量（超限动作全部为内部动作，绝不线上注入 RST）**：
 
 | 层级 | 预算 | 默认 | 超限动作 |
 |---|---|---|---|
 | L1 单连接 QR 挂起 | `qr_pending_budget`（未决 Q 数） | 4096 | 置 `CONN_QR_FLOOD` 异常 → **内部检疫**该连接 |
 | L2 单段 pending 字节 | `segment_pending_cap` | = segment_size | 段标 `ERROR` + `SEGMENT_GAP` + 丢弃该段 pending + GapQuery 自愈 |
-| L3 全局 pending 字节 | `pending_budget_bytes` | 256MB | 逐出全局最旧（安全网） |
+| **L2.5 单连接 OOO 字节** | `conn_pending_cap_bytes` | 16MB | ① 连接内逐出最旧（置 `SEQ_GAP` → GapQuery 自愈）→ ② 窗口内持续耗尽升级**内部检疫**（`CONN_OOO_FLOOD`） |
+| L3 全局 pending 字节 | `pending_budget_bytes` | 256MB | **连接感知逐出**：优先清已检疫/标记连接的缓存，无辜连接最后碰（安全网） |
+
+> **L2.5 填补连接维度字节硬闸**（评审④）：L1 按未决 Q 计数、L2 按段为粒度，均无法限制"单连接持有海量 OOO 字节"。恶意连接可令每段压着 L2 上限、横跨大量段吃满全局 L3，且 L3 逐出最旧是全局粒度、会误伤无辜连接。L2.5 按 `conn_hash` 记账 OOO 字节，把恶意流量挡在连接维度之内：**恶意发包只能烧掉自己的分析预算**。
 
 **连接检疫（Quarantine）语义**——硬阈值必须存在，但**动作绝不是线上 RST**：
 
 - sovVault 是**旁路带外、Fail-Open 被动探针**，硬红线"永不扰动生产"：向线上连接注入 RST 既违反原则，也会被恶意发包者利用来切断受害连接（RST 注入面）；
+- **L2.5 升级路径**：超限先**连接内逐出最旧** OOO 段（不动全局），置 `SEQ_GAP` 交 GapQuery 回源自愈，数据平面照常落盘；窗口（`conn_evict_window_secs`）内配额耗尽达 `conn_evict_threshold` 次 → 升级**内部检疫**，语义同 L1（`CONN_OOO_FLOOD`）；
 - 检疫 = **内部资源回收**：该连接全部在途 Q 翻 `ABORTED_RESOURCE`（保留 Q_IDX 基因锚点），暂停其 QR 分析；**数据平面不受影响**——报文照常落 WAL/PCAP + `DBI_RECORD_TS`，仅索引/匹配成本被省下；
 - 连接关闭时把聚合计数（重传/缺口/洪水）与检疫事件一次性归档 SQLite，可统计可回跳原文；
-- 阈值意义：恶意发包只能**烧掉自己的分析预算**，无法耗尽全局资源或拖垮其他连接。
+- 阈值意义：恶意发包只能**烧掉自己的分析预算**，无法耗尽全局资源或拖垮其他连接；
+- **为何绝不注入 RST（红线三理由）**：① 旁路带外被动探针，"永不扰动生产"是定位；② RST 可伪造——"超限即注入"等于把防御机制变成攻击面，恶意者可伪造 RST 切断受害连接；③ 零收益——恶意连接两端皆受攻击者控制，RST 杀不掉资源开销，只会误伤高压压测下的正常乱序流量。
 
 ### 5.5 慢响应 SLOW RESPONSE（独立路径，基因锚定）
 
@@ -307,7 +318,7 @@ SYN(c→s)         SYN|ACK(s→c)       ACK(c→s)
 
 ## 六、流式重组与解密引擎（承接 v0.2）
 
-- 解密（ChaCha20）→ `(dev,seg,offset)` 幂等落位，乱序暂存有界预算（L2 单段 `segment_pending_cap` + L3 全局 `pending_budget_bytes`，见 §5.7），超限逐出最旧/段检疫；
+- 解密（ChaCha20）→ `(dev,seg,offset)` 幂等落位，乱序暂存有界预算（L2 单段 `segment_pending_cap` + L2.5 单连接 `conn_pending_cap_bytes` + L3 全局 `pending_budget_bytes`，见 §5.7），超限连接内逐出最旧/段检疫/升级内部检疫；
 - 段状态机 `NEW→UNFINISHED⇄SEALED→SKIPPED/ERROR`；Seal 全段四重校验；
 - GapQuery 回源自愈；段号跳空判 Unlink-Oldest。
 
@@ -360,6 +371,9 @@ struct QrPair { status: QrStatus, conn_hash: u64,
 struct ConnState { state, 5-tuple, counters, abs_seq_c/s, consumed_ack_c/s,
                    meta_bind_id, protocol_hint, anomaly_flags: u32 }
 
+// —— 连接级 OOO 字节预算（L2.5，见 §5.7） ——
+struct ConnOOOBudget { used_bytes: u64, evict_streak: u32, window_start: u64 }
+
 // 8 个 DBI 句柄常量 + 批量提交
 struct BatchCommit { lmdb_txn, files_watermark: Vec<(file_id, analysis_offset)> }
 // 提交协议：lmdb.commit() 成功 → sqlite 水位线事务 → 推进内存游标
@@ -392,6 +406,9 @@ gap_self_heal = true
 batch_size = 10000      # 一个 LMDB 事务的报文数（文件边界优先截断）
 pending_budget_bytes = "256MB"  # L3 全局乱序兜底预算
 segment_pending_cap = 0         # L2 单段 pending 硬上限；0 = 默认取 segment_size
+conn_pending_cap_bytes = "16MB" # L2.5 单连接 OOO 字节硬闸；0 = 不限制
+conn_evict_window_secs = 30     # L2.5 配额耗尽计数窗口
+conn_evict_threshold = 3        # 窗口内耗尽次数达此值 → 升级内部检疫
 
 [analysis]
 conn_idle_timeout_secs = 300
@@ -407,11 +424,11 @@ fin_short_timeout_secs = 5  # FIN 半关闭后未决 Q 缩短超时
 | 阶段 | 任务 | 验收 |
 |---|---|---|
 | P0 存储三平面 | File 分层 + SQLite files/水位线/审计/ext_meta + LMDB 8 DBI 骨架 | IDX 编码往返；三平面落位 |
-| P1 重组底座 | 解密+乱序落位+段状态机+四重校验+Gap 自愈+**L2 单段/全局乱序预算与段检疫** | 单测：乱序/幂等/缺口/脏尾/预算超限检疫全绿 |
+| P1 重组底座 | 解密+乱序落位+段状态机+四重校验+Gap 自愈+**L2 单段/L2.5 单连接/L3 全局乱序预算与段检疫** | 单测：乱序/幂等/缺口/脏尾/预算超限检疫全绿 |
 | P2 批量原子性 | Batch=一个 LMDB 事务；LMDB 先行/SQLite 殿后；文件边界屏障；确定性 q_first_idx + 重放自愈 | 注入提交失败 → 水位线不动、重放收敛 |
 | P3 QR 匹配 | 绝对 SEQ 翻译器 + 累积 ACK 消费 + 快/慢路径 + 批量 ACK 聚合 + 连接状态机（同事务） | 握手+管道化+跨批响应+回绕用例断言 QRPair |
 | P3.5 查询索引 | DBI_CONN_QR / DBI_QR_TIME / DBI_PACKET_QR / DBI_RECORD_TS + 单 CONN 检索链路 | 单 CONN 查询毫秒级；报文 IDX 反查命中 |
-| P4 异常与慢路径 | RST 级联熔断 + DUP/SEQ_GAP/ZERO_WIN 只计数 + FIN 缩短超时 + TTL 扫描 + SQLite 审计锚定 IDX + **L1 连接检疫（ABORTED_RESOURCE）** | 异常可统计可回跳原文；RST 不等待超时；恶意发包只烧自己预算 |
+| P4 异常与慢路径 | RST 级联熔断 + DUP/SEQ_GAP/ZERO_WIN 只计数 + FIN 缩短超时 + TTL 扫描 + SQLite 审计锚定 IDX + **L1/L2.5 连接检疫（ABORTED_RESOURCE）** | 异常可统计可回跳原文；RST 不等待超时；恶意发包只烧自己预算、不误伤无辜 |
 | P5 导出查询 E2E | MetaBind/EXT META（含伪 KEY）+ PCAP/Parquet + 双输入格式 | 双 VM E2E：MD5 一致 + QR 命中 + 回放不丢慢 Q |
 
 ## 十二、验收标准
@@ -424,7 +441,7 @@ fin_short_timeout_secs = 5  # FIN 半关闭后未决 Q 缩短超时
 | 单 CONN 查询 | DBI_CONN_QR 前缀扫描毫秒级；`FILE_ID.OFFSET` 反查所属 QR O(logN) |
 | RST 处理 | RST 到达 → 该连接全部 PENDING 原子翻 RST_ABORT，不等 30s |
 | 异常 | DUP/SEQ_GAP/ZERO_WIN/CRC_DROP/RST/QR_TIMEOUT 全量可统计可回跳；**"网络天气"型只计数不逐条落库** |
-| 资源防御 | 三层预算超限 → 内部检疫/段 ERROR；**无线上 RST 注入**；恶意连接无法耗尽全局资源 |
+| 资源防御 | 四层预算超限 → 内部检疫/段 ERROR/连接内逐出最旧；**无线上 RST 注入**；恶意连接无法耗尽全局资源、不误伤无辜连接 |
 | PCAP | Wireshark 还原握手 + `[Packet size limited]` 精准出现 |
 | 资源 | RSS ≤ 256MB；CPU ≤ 20%（4 核单节点）；LMDB map_size 稀疏不占物理 |
 

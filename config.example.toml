@@ -1,0 +1,43 @@
+# sovVault 配置示例（完整 Schema 见 09_sovVault_实施方案.md §11）
+# 所有路径相对 [storage].root 展开；CLI 参数优先于本文件。
+
+[zenoh]
+connect = ["tcp/10.0.0.2:7447"]   # client 端点（显式 connect）
+listen = []                        # peer/listener
+
+[crypto]
+key_file = "/etc/sovvault/keys/slimsync.key"   # 32B，与 slimSync 一致
+# key_hex = "…"   # 二选一，hex 优先
+
+[storage]
+root = "/var/lib/sovvault"
+hot_dir = "hot"            # WAL 重组中
+warm_dir = "warm"          # WAL/PCAP 归档（经典 PCAP，切段 ≤4GB）
+ledger_db = "ledger.db"    # SQLite 管理平面
+lmdb_dir = "qridx"         # LMDB 索引平面
+lmdb_map_size = "64GB"     # 稀疏 mmap；杜绝 MDB_MAP_FULL
+
+[ingest]
+subscribe_batches = true   # 批量帧
+subscribe_chunks = false   # 单帧兼容（默认关）
+gap_self_heal = true
+batch_size = 10000         # 一个 LMDB 事务的报文数（文件边界优先截断）
+pending_budget_bytes = "256MB"   # L3 全局乱序兜底
+segment_pending_cap = 0          # L2 单段硬上限；0=默认 segment_size
+conn_pending_cap_bytes = "16MB"  # L2.5 单连接 OOO 字节硬闸；0=不限制
+conn_evict_window_secs = 30      # L2.5 配额耗尽计数窗口
+conn_evict_threshold = 3         # 窗口内耗尽次数达此值 → 升级内部检疫
+
+[analysis]
+conn_idle_timeout_secs = 300
+qr_pending_budget = 4096    # L1 单连接未决 Q 硬上限 → 内部检疫
+ack_tolerance = 4
+qr_timeout_secs = 30
+ttl_scan_secs = 1
+fin_short_timeout_secs = 5
+meta_binds = [ { name="web", proto=6, dst_port=80, fingerprint="http", extractor="http_line" },
+               { name="https", proto=6, dst_port=443, fingerprint="tls", extractor="sni" },
+               { name="dns", proto=17, dst_port=53, fingerprint="dns", extractor="qname" } ]
+
+[query]
+export_buf_size = 4096      # PCAP 流式导出缓冲（包）
