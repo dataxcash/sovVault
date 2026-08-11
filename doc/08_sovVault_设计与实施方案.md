@@ -8,6 +8,10 @@
 > 2. QRPAIR 首发生命周期实体（PENDING 自 Q 诞生）。
 > 3. QR 匹配升级累积 ACK 消费模型；批量原子性（Batch=一个 LMDB 事务，LMDB 先行/SQLite 殿后，文件边界屏障）。
 >
+> **v0.4 修订（响应评审③）：**
+> 1. **两项决议定案**：DUP/RETRANS/ZERO_WIN 等"网络天气"型异常**只计数、连接关闭时聚合归档一次**，绝不逐条落 SQLite；定向五元组索引（DBI_RECORD_5TUPLE）**延期至阶段二**，PCAP 导出保持 `DBI_RECORD_TS` 时间游标 + 内存 BPF 过滤。
+> 2. **资源防御与连接检疫**：三层乱序缓存预算（单连接 QR 挂起硬上限 / 单段 pending 字节硬上限 / 全局兜底预算）。超限触发**内部检疫**（暂停该连接 QR 分析，数据平面不受影响），**绝不向线上注入 RST**——sovVault 为旁路带外被动探针，硬红线"永不扰动生产"。
+>
 > **v0.3 修订（响应评审②）：**
 > 1. **SEQ 回绕根治**：每连接每方向引入 `raw(u32)→abs(48b)` 绝对序列号流翻译器，QR 挂起/消费 Key 全部用绝对号，B+树扫描免模差、无断层；DUP/RETRANS 判定同时落地。
 > 2. **RST 级联熔断**：RST 帧到达 → 同事务内将该连接全部 PENDING Q 翻转为 `RST_ABORT`，不等待超时。
@@ -127,7 +131,7 @@ bit8 SEQ_GAP（乱序/缺包）               bit9 DEGRADED（探针降级）
 ### 4.2 DBI_QR_PAIR — QRPAIR 首发生命周期实体（主表）
 ```
 Key:   [q_first_idx: u64]                  // 确定性主键（回放幂等）
-Value: status:u8(0=PENDING 1=MATCHED 2=TIMEOUT 3=UNMATCHED 4=RST_ABORT) |
+Value: status:u8(0=PENDING 1=MATCHED 2=TIMEOUT 3=UNMATCHED 4=RST_ABORT 5=ABORTED_RESOURCE) |
        conn_hash:u64 | q_idx_list:[u64;N] | r_idx_list:[u64;M] |
        q_ts:u64 | r_ts:u64 | latency_ms:u64 | q_len:u32 | r_len:u32 |
        abs_q_seq:u48 | abs_q_end:u48 |
@@ -248,9 +252,9 @@ SYN(c→s)         SYN|ACK(s→c)       ACK(c→s)
 | `SEGMENT_SKIPPED` | Seal 段号跳空（Unlink-Oldest） | 连接标 INCOMPLETE，平滑跳过 |
 | `SEGMENT_GAP` | Seal 缺口 | GapQuery 回源自愈；失败落审计 |
 | `CRC_DROP` | 四重校验脏尾退栈 | 计字节，零静默吃包 |
-| `DUP/RETRANS` | 绝对 SEQ 翻译器 `d≤0` | 计重复，`MDB_NOOVERWRITE` 幂等跳过 |
-| `SEQ_GAP/乱序` | `d>0 且 abs_seq > last+len` | 记缺口，等待/回源自愈 |
-| `ZERO_WIN` | `window==0` | 记零窗口阻塞，不误判丢包 |
+| `DUP/RETRANS` | 绝对 SEQ 翻译器 `d≤0` | **只计数**（anomaly_flags + 每连接计数器），`MDB_NOOVERWRITE` 幂等跳过 |
+| `SEQ_GAP/乱序` | `d>0 且 abs_seq > last+len` | 计数 + 置位，等待/回源自愈 |
+| `ZERO_WIN` | `window==0` | **只计数**零窗口阻塞，不误判丢包 |
 | **`CONN_RST` 级联熔断** | RST 帧 | **同事务原子**：该连接全部 PENDING Q 翻 `RST_ABORT` + 清理挂起/TTL + 记异常，不等超时 |
 | `FIN` 半关闭 | FIN 帧 | 标记 HALF_CLOSED；未决 Q 启用缩短超时（如 min(qr_timeout,5s)） |
 | `QR_TIMEOUT` | TTL 扫描超阈值（默认 30s） | QRPAIR→TIMEOUT，保留 Q_IDX+Req_KEY |
@@ -258,6 +262,25 @@ SYN(c→s)         SYN|ACK(s→c)       ACK(c→s)
 | `DEGRADED` | Record flags bit0 | 时序完整性受损标记 |
 
 审计异常统一落 **SQLite `anomalies`**（低频可 SQL 查询）；LMDB 仅维护工作态，超时由 `DBI_PENDING_TTL` 驱动（后台协程每 1s 开 RO_TXN 扫头部，按百条批转 RW_TXN 翻 TIMEOUT，短事务不锁库）。
+
+> **"网络天气"型异常只计数，不逐条落 SQLite（评审③定案）**：DUP/RETRANS/ZERO_WIN 在高压网络中是常态而非致命异常，逐条入库会造成管理平面写放大、反向阻塞 Ingest。它们仅累加进 `DBI_CONN_STATE.anomaly_flags` 与每连接计数器，**连接关闭/RST 时聚合归档一次**——离线 SQL 统计看的是"该连接重传率"，不是"第 3421 个包是否重传"。
+
+### 5.7 资源防御：乱序缓存预算与连接检疫 ★（评审③）
+
+**三层预算，硬上限逐级拦截恶意/病态流量**：
+
+| 层级 | 预算 | 默认 | 超限动作 |
+|---|---|---|---|
+| L1 单连接 QR 挂起 | `qr_pending_budget`（未决 Q 数） | 4096 | 置 `CONN_QR_FLOOD` 异常 → **内部检疫**该连接 |
+| L2 单段 pending 字节 | `segment_pending_cap` | = segment_size | 段标 `ERROR` + `SEGMENT_GAP` + 丢弃该段 pending + GapQuery 自愈 |
+| L3 全局 pending 字节 | `pending_budget_bytes` | 256MB | 逐出全局最旧（安全网） |
+
+**连接检疫（Quarantine）语义**——硬阈值必须存在，但**动作绝不是线上 RST**：
+
+- sovVault 是**旁路带外、Fail-Open 被动探针**，硬红线"永不扰动生产"：向线上连接注入 RST 既违反原则，也会被恶意发包者利用来切断受害连接（RST 注入面）；
+- 检疫 = **内部资源回收**：该连接全部在途 Q 翻 `ABORTED_RESOURCE`（保留 Q_IDX 基因锚点），暂停其 QR 分析；**数据平面不受影响**——报文照常落 WAL/PCAP + `DBI_RECORD_TS`，仅索引/匹配成本被省下；
+- 连接关闭时把聚合计数（重传/缺口/洪水）与检疫事件一次性归档 SQLite，可统计可回跳原文；
+- 阈值意义：恶意发包只能**烧掉自己的分析预算**，无法耗尽全局资源或拖垮其他连接。
 
 ### 5.5 慢响应 SLOW RESPONSE（独立路径，基因锚定）
 
@@ -284,7 +307,7 @@ SYN(c→s)         SYN|ACK(s→c)       ACK(c→s)
 
 ## 六、流式重组与解密引擎（承接 v0.2）
 
-- 解密（ChaCha20）→ `(dev,seg,offset)` 幂等落位，乱序暂存有界预算，超限逐出最旧；
+- 解密（ChaCha20）→ `(dev,seg,offset)` 幂等落位，乱序暂存有界预算（L2 单段 `segment_pending_cap` + L3 全局 `pending_budget_bytes`，见 §5.7），超限逐出最旧/段检疫；
 - 段状态机 `NEW→UNFINISHED⇄SEALED→SKIPPED/ERROR`；Seal 全段四重校验；
 - GapQuery 回源自愈；段号跳空判 Unlink-Oldest。
 
@@ -367,10 +390,12 @@ lmdb_map_size = "64GB"  # 稀疏 mmap，虚拟内存；杜绝 MDB_MAP_FULL
 subscribe_batches = true
 gap_self_heal = true
 batch_size = 10000      # 一个 LMDB 事务的报文数（文件边界优先截断）
+pending_budget_bytes = "256MB"  # L3 全局乱序兜底预算
+segment_pending_cap = 0         # L2 单段 pending 硬上限；0 = 默认取 segment_size
 
 [analysis]
 conn_idle_timeout_secs = 300
-qr_pending_budget = 4096
+qr_pending_budget = 4096   # L1 单连接未决 Q 硬上限（超限 → 内部检疫，非线上 RST）
 ack_tolerance = 4
 qr_timeout_secs = 30     # 慢响应判超时
 ttl_scan_secs = 1        # TTL 后台扫描周期
@@ -382,11 +407,11 @@ fin_short_timeout_secs = 5  # FIN 半关闭后未决 Q 缩短超时
 | 阶段 | 任务 | 验收 |
 |---|---|---|
 | P0 存储三平面 | File 分层 + SQLite files/水位线/审计/ext_meta + LMDB 8 DBI 骨架 | IDX 编码往返；三平面落位 |
-| P1 重组底座 | 解密+乱序落位+段状态机+四重校验+Gap 自愈 | 单测：乱序/幂等/缺口/脏尾全绿 |
+| P1 重组底座 | 解密+乱序落位+段状态机+四重校验+Gap 自愈+**L2 单段/全局乱序预算与段检疫** | 单测：乱序/幂等/缺口/脏尾/预算超限检疫全绿 |
 | P2 批量原子性 | Batch=一个 LMDB 事务；LMDB 先行/SQLite 殿后；文件边界屏障；确定性 q_first_idx + 重放自愈 | 注入提交失败 → 水位线不动、重放收敛 |
 | P3 QR 匹配 | 绝对 SEQ 翻译器 + 累积 ACK 消费 + 快/慢路径 + 批量 ACK 聚合 + 连接状态机（同事务） | 握手+管道化+跨批响应+回绕用例断言 QRPair |
 | P3.5 查询索引 | DBI_CONN_QR / DBI_QR_TIME / DBI_PACKET_QR / DBI_RECORD_TS + 单 CONN 检索链路 | 单 CONN 查询毫秒级；报文 IDX 反查命中 |
-| P4 异常与慢路径 | RST 级联熔断 + DUP/SEQ_GAP/ZERO_WIN + FIN 缩短超时 + TTL 扫描 + SQLite 审计锚定 IDX | 异常可统计可回跳原文；RST 不等待超时 |
+| P4 异常与慢路径 | RST 级联熔断 + DUP/SEQ_GAP/ZERO_WIN 只计数 + FIN 缩短超时 + TTL 扫描 + SQLite 审计锚定 IDX + **L1 连接检疫（ABORTED_RESOURCE）** | 异常可统计可回跳原文；RST 不等待超时；恶意发包只烧自己预算 |
 | P5 导出查询 E2E | MetaBind/EXT META（含伪 KEY）+ PCAP/Parquet + 双输入格式 | 双 VM E2E：MD5 一致 + QR 命中 + 回放不丢慢 Q |
 
 ## 十二、验收标准
@@ -398,7 +423,8 @@ fin_short_timeout_secs = 5  # FIN 半关闭后未决 Q 缩短超时
 | QR 匹配 | 精确 ≥99%；管道化/批量 ACK ≥95%；**SEQ 回绕场景零误判**；回放/查询 PENDING+异常 Q 零遗漏 |
 | 单 CONN 查询 | DBI_CONN_QR 前缀扫描毫秒级；`FILE_ID.OFFSET` 反查所属 QR O(logN) |
 | RST 处理 | RST 到达 → 该连接全部 PENDING 原子翻 RST_ABORT，不等 30s |
-| 异常 | DUP/SEQ_GAP/ZERO_WIN/CRC_DROP/RST/QR_TIMEOUT 全量可统计可回跳 |
+| 异常 | DUP/SEQ_GAP/ZERO_WIN/CRC_DROP/RST/QR_TIMEOUT 全量可统计可回跳；**"网络天气"型只计数不逐条落库** |
+| 资源防御 | 三层预算超限 → 内部检疫/段 ERROR；**无线上 RST 注入**；恶意连接无法耗尽全局资源 |
 | PCAP | Wireshark 还原握手 + `[Packet size limited]` 精准出现 |
 | 资源 | RSS ≤ 256MB；CPU ≤ 20%（4 核单节点）；LMDB map_size 稀疏不占物理 |
 

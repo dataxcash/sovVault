@@ -8,6 +8,10 @@
 > 2. QRPAIR promoted to a first-class lifecycle entity (PENDING from the moment a Q is born).
 > 3. QR matching upgraded to a cumulative-ACK consumption model; batch atomicity (a Batch = one LMDB transaction, LMDB-first / SQLite-watermark-last, file boundary as commit barrier).
 >
+> **v0.4 changes (response to review ③):**
+> 1. **Two decisions locked**: "network-weather" anomalies (DUP/RETRANS/ZERO_WIN) are **count-only, aggregated and archived once at connection close** — never per-packet into SQLite; the directed 5-tuple index (`DBI_RECORD_5TUPLE`) is **deferred to phase 2** — PCAP export stays on `DBI_RECORD_TS` time cursor + in-memory BPF filtering.
+> 2. **Resource defense & connection quarantine**: three-tier out-of-order buffer budgets (per-conn QR pending hard cap / per-segment pending byte cap / global fallback). Exceeding triggers **internal quarantine** (QR analysis suspended for that connection; the data plane is unaffected) — **never an on-wire RST**, since sovVault is an out-of-band, fail-open passive probe bound by the "never perturb production" red line.
+>
 > **v0.3 changes (response to review ②):**
 > 1. **SEQ wrap-hardening**: a per-connection, per-direction `raw(u32)→abs(48b)` absolute sequence stream translator; all QR pending/consume keys use absolute numbers — B+tree scans need no modular arithmetic and have no wrap discontinuity; DUP/RETRANS detection lands at the same time.
 > 2. **RST cascade breaker**: on an RST frame, all PENDING Qs of that connection flip to `RST_ABORT` in the same transaction — no waiting for the timeout.
@@ -131,7 +135,7 @@ bit8 SEQ_GAP (out-of-order/missing)           bit9 DEGRADED (probe degraded)
 ### 4.2 DBI_QR_PAIR — QRPAIR First-Class Lifecycle Entity (primary)
 ```
 Key:   [q_first_idx: u64]                  // deterministic primary key (replay-idempotent)
-Value: status:u8(0=PENDING 1=MATCHED 2=TIMEOUT 3=UNMATCHED 4=RST_ABORT) |
+Value: status:u8(0=PENDING 1=MATCHED 2=TIMEOUT 3=UNMATCHED 4=RST_ABORT 5=ABORTED_RESOURCE) |
        conn_hash:u64 | q_idx_list:[u64;N] | r_idx_list:[u64;M] |
        q_ts:u64 | r_ts:u64 | latency_ms:u64 | q_len:u32 | r_len:u32 |
        abs_q_seq:u48 | abs_q_end:u48 |
@@ -252,9 +256,9 @@ Counters and absolute SEQ streams accumulate inside the batch's LMDB transaction
 | `SEGMENT_SKIPPED` | Seal segment-number gap (Unlink-Oldest) | mark conn INCOMPLETE, skip smoothly |
 | `SEGMENT_GAP` | Seal gap (sealed_size > received) | GapQuery self-heal; audit on failure |
 | `CRC_DROP` | quadruple-validation dirty tail | count bytes, zero silent corruption |
-| `DUP/RETRANS` | absolute-SEQ translator `d≤0` | count, idempotent skip (`MDB_NOOVERWRITE`) |
-| `SEQ_GAP/out-of-order` | `d>0 and abs_seq > last+len` | record gap, wait / self-heal |
-| `ZERO_WIN` | `window==0` | record zero-window stall, not misjudged as loss |
+| `DUP/RETRANS` | absolute-SEQ translator `d≤0` | **count-only** (anomaly_flags + per-conn counter), idempotent skip (`MDB_NOOVERWRITE`) |
+| `SEQ_GAP/out-of-order` | `d>0 and abs_seq > last+len` | count + flag; wait / self-heal |
+| `ZERO_WIN` | `window==0` | **count-only** zero-window stall, not misjudged as loss |
 | **`CONN_RST` cascade breaker** | RST frame | **atomically in the same txn**: all PENDING Qs → `RST_ABORT` + purge pending/TTL + audit, no timeout wait |
 | `FIN` half-closed | FIN frame | mark HALF_CLOSED; unresolved Qs get shortened timeout (e.g. min(qr_timeout, 5s)) |
 | `QR_TIMEOUT` | TTL scan past threshold (default 30s) | QRPAIR→TIMEOUT, Q_IDX+Req_KEY retained |
@@ -262,6 +266,25 @@ Counters and absolute SEQ streams accumulate inside the batch's LMDB transaction
 | `DEGRADED` | Record flags bit0 | temporal-integrity damage marker |
 
 Audit anomalies are persisted uniformly in **SQLite `anomalies`** (low-frequency, SQL-queryable); LMDB keeps only working state. Timeout is driven by `DBI_PENDING_TTL` (background task: every 1 s open an RO_TXN, scan the head, convert in batches of ~100 via short RW_TXNs to flip TIMEOUT — short transactions, no long-held locks).
+
+> **"Network-weather" anomalies are count-only, never per-packet into SQLite (review ③ decision)**: DUP/RETRANS/ZERO_WIN are the norm under heavy load, not fatal anomalies; per-packet rows would cause management-plane write amplification and block the Ingest pipeline. They accumulate only into `DBI_CONN_STATE.anomaly_flags` and per-connection counters, **aggregated and archived once at connection close / RST** — offline SQL statistics care about "this connection's retransmission rate", not "whether packet #3421 is a retransmission".
+
+### 5.7 Resource Defense: Out-of-Order Buffer Budget & Connection Quarantine ★ (review ③)
+
+**Three tiers, hard caps intercept malicious/pathological traffic layer by layer:**
+
+| Tier | Budget | Default | On exceed |
+|---|---|---|---|
+| L1 per-conn QR pending | `qr_pending_budget` (pending Q count) | 4096 | set `CONN_QR_FLOOD` anomaly → **internal quarantine** of that connection |
+| L2 per-segment pending bytes | `segment_pending_cap` | = segment_size | mark segment `ERROR` + `SEGMENT_GAP` + drop its pending + GapQuery self-heal |
+| L3 global pending bytes | `pending_budget_bytes` | 256 MB | evict globally-oldest (safety net) |
+
+**Connection quarantine semantics** — the hard threshold must exist, but the action is **never an on-wire RST**:
+
+- sovVault is an **out-of-band, fail-open passive probe**; the red line "never perturb production" forbids injecting RST into live connections — it would also hand malicious senders a lever to kill victim connections (RST injection surface);
+- Quarantine = **internal resource reclaim**: all in-flight Qs of that connection flip to `ABORTED_RESOURCE` (Q_IDX genetic anchor retained), QR analysis suspended; **the data plane is unaffected** — packets still land in WAL/PCAP + `DBI_RECORD_TS`, only indexing/matching cost is spared;
+- At connection close, aggregated counters (retransmission/gap/flood) and the quarantine event are archived to SQLite once — countable and jump-back-able;
+- Meaning of the threshold: a malicious sender can only burn **its own analysis budget**; it cannot exhaust global resources or drag down other connections.
 
 ### 5.5 Slow Responses (independent path, genetically anchored)
 
@@ -288,7 +311,7 @@ Single-connection example: `MDB_SET_RANGE([ConnHash][t0])` → iterate `(q_ts, q
 
 ## 6. Reassembly & Decryption Engine (from v0.2)
 
-- Decrypt (ChaCha20) → `(dev,seg,offset)` idempotent placement, bounded out-of-order staging budget, evict oldest on overflow;
+- Decrypt (ChaCha20) → `(dev,seg,offset)` idempotent placement, bounded out-of-order staging budget (L2 per-segment `segment_pending_cap` + L3 global `pending_budget_bytes`, see §5.7), evict oldest / quarantine segment on exceed;
 - Segment state machine `NEW→UNFINISHED⇄SEALED→SKIPPED/ERROR`; full-segment quadruple validation on Seal;
 - GapQuery self-heal; segment-number gap ⇒ Unlink-Oldest.
 
@@ -371,10 +394,12 @@ lmdb_map_size = "64GB"  # sparse mmap, virtual memory; eliminates MDB_MAP_FULL
 subscribe_batches = true
 gap_self_heal = true
 batch_size = 10000      # packets per one LMDB transaction (file boundary truncates first)
+pending_budget_bytes = "256MB"  # L3 global out-of-order fallback budget
+segment_pending_cap = 0         # L2 per-segment pending hard cap; 0 = default segment_size
 
 [analysis]
 conn_idle_timeout_secs = 300
-qr_pending_budget = 4096
+qr_pending_budget = 4096   # L1 per-conn pending-Q hard cap (exceed → internal quarantine, not on-wire RST)
 ack_tolerance = 4
 qr_timeout_secs = 30     # slow-response timeout
 ttl_scan_secs = 1        # TTL background scan period
@@ -386,11 +411,11 @@ fin_short_timeout_secs = 5  # shortened timeout for pending Qs after FIN half-cl
 | Phase | Task | Acceptance |
 |---|---|---|
 | P0 storage planes | File tiering + SQLite files/watermark/audit/ext_meta + LMDB 8-DBI skeleton | IDX encode round-trip; planes in place |
-| P1 reassembly | decrypt + out-of-order placement + segment state machine + quadruple validation + Gap self-heal | unit tests: out-of-order/idempotent/gap/dirty-tail green |
+| P1 reassembly | decrypt + out-of-order placement + segment state machine + quadruple validation + Gap self-heal + **L2 per-segment/global budgets & segment quarantine** | unit tests: out-of-order/idempotent/gap/dirty-tail/budget-quarantine green |
 | P2 batch atomicity | Batch = one LMDB txn; LMDB-first/SQLite-last; file-boundary barrier; deterministic q_first_idx + replay self-heal | inject commit failure → watermark unmoved, replay converges |
 | P3 QR matching | absolute-SEQ translator + cumulative-ACK consumption + fast/slow paths + batched-ACK aggregation + connection state machine (same txn) | handshake + pipelining + cross-batch response + wrap cases assert QRPair |
 | P3.5 query indexes | DBI_CONN_QR / DBI_QR_TIME / DBI_PACKET_QR / DBI_RECORD_TS + single-CONN lookup chain | single-CONN query ms-level; packet-IDX reverse lookup hits |
-| P4 anomalies & slow path | RST cascade breaker + DUP/SEQ_GAP/ZERO_WIN + FIN shortened timeout + TTL scan + SQLite audit anchored by IDX | anomalies countable & jump-back; RST never waits for timeout |
+| P4 anomalies & slow path | RST cascade breaker + DUP/SEQ_GAP/ZERO_WIN count-only + FIN shortened timeout + TTL scan + SQLite audit anchored by IDX + **L1 connection quarantine (ABORTED_RESOURCE)** | anomalies countable & jump-back; RST never waits for timeout; malicious sender only burns its own budget |
 | P5 export/query E2E | MetaBind/EXT META (incl. pseudo-KEY) + PCAP/Parquet + dual input formats | dual-VM E2E: MD5 identical + QR hit + replay never drops slow Qs |
 
 ## 12. Acceptance Criteria
@@ -402,7 +427,8 @@ fin_short_timeout_secs = 5  # shortened timeout for pending Qs after FIN half-cl
 | QR matching | exact ≥99%; pipelined/batched-ACK ≥95%; **zero misjudgment on SEQ wrap**; replay/query zero loss of PENDING & abnormal Qs |
 | Single-CONN query | DBI_CONN_QR prefix scan ms-level; `FILE_ID.OFFSET` → owning QR in O(log N) |
 | RST handling | RST arrival → all PENDING Qs of the connection flip RST_ABORT atomically, never waiting 30 s |
-| Anomalies | DUP/SEQ_GAP/ZERO_WIN/CRC_DROP/RST/QR_TIMEOUT all countable and jump-back-able |
+| Anomalies | DUP/SEQ_GAP/ZERO_WIN/CRC_DROP/RST/QR_TIMEOUT all countable and jump-back-able; **"network-weather" types are count-only, never per-packet** |
+| Resource defense | three-tier budget exceed → internal quarantine / segment ERROR; **zero on-wire RST injection**; malicious connection cannot exhaust global resources |
 | PCAP | Wireshark reproduces handshake + `[Packet size limited]` appears precisely |
 | Resources | RSS ≤ 256 MB; CPU ≤ 20% (4-core single node); LMDB map_size sparse (no physical cost) |
 
