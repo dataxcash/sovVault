@@ -142,17 +142,76 @@ impl Default for QueryConfig {
     }
 }
 
+/// CLI 全局覆盖项（优先级：CLI > 环境变量 SOVVAULT_* > TOML > 默认值）。
+#[derive(Debug, Clone, Default)]
+pub struct PathOverrides {
+    pub root: Option<std::path::PathBuf>,
+    pub hot_dir: Option<String>,
+    pub warm_dir: Option<String>,
+    pub ledger_db: Option<String>,
+    pub lmdb_dir: Option<String>,
+    pub lmdb_map_size: Option<String>,
+}
+
 impl Config {
-    /// 从 TOML 文件加载；文件不存在则回退默认配置（CLI 覆盖优先）。
-    pub fn load(path: Option<&Path>) -> Result<Config> {
-        match path {
+    /// 分层加载：TOML（或默认值）→ 环境变量 → CLI 覆盖 → 校验。
+    pub fn load(path: Option<&Path>, cli: &PathOverrides) -> Result<Config> {
+        let mut cfg = match path {
             Some(p) => {
                 let text = std::fs::read_to_string(p)
                     .with_context(|| format!("读取配置失败: {}", p.display()))?;
-                Ok(toml::from_str(&text)
-                    .with_context(|| format!("解析配置失败: {}", p.display()))?)
+                toml::from_str(&text).with_context(|| format!("解析配置失败: {}", p.display()))?
             }
-            None => Ok(Config::default()),
+            None => Config::default(),
+        };
+        cfg.apply_env();
+        cfg.apply_cli(cli);
+        cfg.validate()?;
+        Ok(cfg)
+    }
+
+    /// 环境变量层：`SOVVAULT_<KEY>`。
+    fn apply_env(&mut self) {
+        self.storage.root = env_str("SOVVAULT_ROOT")
+            .map(std::path::PathBuf::from)
+            .unwrap_or(self.storage.root.clone());
+        set_env(&mut self.storage.hot_dir, "SOVVAULT_HOT_DIR");
+        set_env(&mut self.storage.warm_dir, "SOVVAULT_WARM_DIR");
+        set_env(&mut self.storage.ledger_db, "SOVVAULT_LEDGER_DB");
+        set_env(&mut self.storage.lmdb_dir, "SOVVAULT_LMDB_DIR");
+        set_env(&mut self.storage.lmdb_map_size, "SOVVAULT_LMDB_MAP_SIZE");
+    }
+
+    /// CLI 层（最高优先级）。
+    fn apply_cli(&mut self, cli: &PathOverrides) {
+        if let Some(root) = &cli.root {
+            self.storage.root = root.clone();
+        }
+        if let Some(v) = &cli.hot_dir {
+            self.storage.hot_dir = v.clone();
+        }
+        if let Some(v) = &cli.warm_dir {
+            self.storage.warm_dir = v.clone();
+        }
+        if let Some(v) = &cli.ledger_db {
+            self.storage.ledger_db = v.clone();
+        }
+        if let Some(v) = &cli.lmdb_dir {
+            self.storage.lmdb_dir = v.clone();
+        }
+        if let Some(v) = &cli.lmdb_map_size {
+            self.storage.lmdb_map_size = v.clone();
+        }
+    }
+
+    /// 存储根目录（绝对化）。
+    pub fn storage_root(&self) -> PathBuf {
+        if self.storage.root.is_absolute() {
+            self.storage.root.clone()
+        } else {
+            std::env::current_dir()
+                .map(|c| c.join(&self.storage.root))
+                .unwrap_or_else(|_| self.storage.root.clone())
         }
     }
 
@@ -168,17 +227,6 @@ impl Config {
             bail!("analysis.qr_pending_budget 必须 > 0");
         }
         Ok(())
-    }
-
-    /// 存储根目录（绝对化）。
-    pub fn storage_root(&self) -> PathBuf {
-        if self.storage.root.is_absolute() {
-            self.storage.root.clone()
-        } else {
-            std::env::current_dir()
-                .map(|c| c.join(&self.storage.root))
-                .unwrap_or_else(|_| self.storage.root.clone())
-        }
     }
 
     pub fn hot_dir(&self) -> PathBuf {
@@ -207,6 +255,18 @@ impl Config {
 
     pub fn conn_pending_cap_bytes(&self) -> Result<u64> {
         parse_size(&self.ingest.conn_pending_cap_bytes)
+    }
+}
+
+/// 读取环境变量（非空才覆盖）。
+fn env_str(key: &str) -> Option<String> {
+    std::env::var(key).ok().filter(|s| !s.is_empty())
+}
+
+/// 环境变量非空时覆盖目标字段。
+fn set_env(dst: &mut String, key: &str) {
+    if let Some(v) = env_str(key) {
+        *dst = v;
     }
 }
 
@@ -254,8 +314,7 @@ mod tests {
 
     #[test]
     fn default_config_loads_and_validates() {
-        let cfg = Config::default();
-        assert!(cfg.validate().is_ok());
+        let cfg = Config::load(None, &PathOverrides::default()).unwrap();
         assert_eq!(cfg.ingest.batch_size, 10000);
         assert_eq!(cfg.analysis.qr_pending_budget, 4096);
         assert_eq!(
@@ -275,5 +334,47 @@ mod tests {
         assert_eq!(cfg.zenoh.connect, vec!["tcp/10.0.0.2:7447".to_string()]);
         assert_eq!(cfg.ingest.conn_evict_window_secs, 30);
         assert_eq!(cfg.ingest.conn_evict_threshold, 3);
+    }
+
+    #[test]
+    fn precedence_cli_over_env_over_toml() {
+        let text = std::fs::read_to_string("config.example.toml").unwrap();
+        let p = std::env::temp_dir().join(format!("sovvault-cfg-{}.toml", std::process::id()));
+        std::fs::write(&p, &text).unwrap();
+
+        // 基线：TOML 的 root=/var/lib/sovvault。
+        let cfg = Config::load(Some(&p), &PathOverrides::default()).unwrap();
+        assert_eq!(
+            cfg.storage.root,
+            std::path::PathBuf::from("/var/lib/sovvault")
+        );
+
+        // CLI 覆盖 root + hot_dir。
+        let over = PathOverrides {
+            root: Some("/tmp/sovvault-test".into()),
+            hot_dir: Some("ht".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(&p), &over).unwrap();
+        assert_eq!(
+            cfg.storage.root,
+            std::path::PathBuf::from("/tmp/sovvault-test")
+        );
+        assert_eq!(cfg.storage.hot_dir, "ht");
+
+        // 环境变量层压过 TOML。
+        std::env::set_var("SOVVAULT_LMDB_MAP_SIZE", "8GB");
+        let cfg = Config::load(Some(&p), &PathOverrides::default()).unwrap();
+        assert_eq!(cfg.storage.lmdb_map_size, "8GB");
+        // CLI 仍压过环境变量。
+        let over = PathOverrides {
+            lmdb_map_size: Some("16GB".into()),
+            ..Default::default()
+        };
+        let cfg = Config::load(Some(&p), &over).unwrap();
+        assert_eq!(cfg.storage.lmdb_map_size, "16GB");
+        std::env::remove_var("SOVVAULT_LMDB_MAP_SIZE");
+
+        let _ = std::fs::remove_file(&p);
     }
 }

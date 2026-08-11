@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
-use sov_vault::config::Config;
+use sov_vault::config::{Config, PathOverrides};
 use sov_vault::db::DbRegistry;
 use sov_vault::ledger::Ledger;
 
@@ -21,6 +21,25 @@ struct Cli {
     /// 日志级别（error/warn/info/debug/trace）。
     #[arg(short, long, global = true, default_value = "info")]
     log: String,
+
+    /// 存储根目录（CLI 覆盖，优先级最高）。
+    #[arg(long, global = true)]
+    root: Option<std::path::PathBuf>,
+    /// 热目录（重组中）。
+    #[arg(long, global = true)]
+    hot_dir: Option<String>,
+    /// 温目录（归档）。
+    #[arg(long, global = true)]
+    warm_dir: Option<String>,
+    /// SQLite 管理平面文件。
+    #[arg(long, global = true)]
+    ledger_db: Option<String>,
+    /// LMDB 索引平面目录。
+    #[arg(long, global = true)]
+    lmdb_dir: Option<String>,
+    /// LMDB 稀疏 mmap 大小（如 64GB）。
+    #[arg(long, global = true)]
+    lmdb_map_size: Option<String>,
 
     #[command(subcommand)]
     command: Command,
@@ -50,17 +69,22 @@ fn main() -> Result<()> {
         .with_env_filter(cli.log.as_str())
         .init();
 
-    let cfg = Config::load(cli.config.as_deref())?;
-    cfg.validate()?;
+    let overrides = PathOverrides {
+        root: cli.root.clone(),
+        hot_dir: cli.hot_dir.clone(),
+        warm_dir: cli.warm_dir.clone(),
+        ledger_db: cli.ledger_db.clone(),
+        lmdb_dir: cli.lmdb_dir.clone(),
+        lmdb_map_size: cli.lmdb_map_size.clone(),
+    };
+    let cfg = Config::load(cli.config.as_deref(), &overrides)?;
 
     match cli.command {
         Command::Serve => cmd_serve(&cfg),
-        other => {
-            anyhow::bail!(
-                "子命令 {:?} 尚未在本期（P0）实现，按 09 白皮书阶段推进",
-                other
-            )
-        }
+        other => anyhow::bail!(
+            "子命令 {:?} 尚未在本期（P0）实现，按 09 白皮书阶段推进",
+            other
+        ),
     }
 }
 
