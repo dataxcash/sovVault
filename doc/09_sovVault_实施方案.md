@@ -1,7 +1,8 @@
 # sovVault 详细实施方案（实施白皮书 v0.2）
 
-> 状态：**待评审** | 版本：v0.2 | 前置依赖：`08_sovVault_设计与实施方案.md`（v0.4）
+> 状态：**待评审** | 版本：v0.3 | 前置依赖：`08_sovVault_设计与实施方案.md`（v0.6）
 > v0.2 变更：新增 **L2.5 单连接 OOO 字节预算**（填补 L1/L2 间的连接维度字节硬闸）——超限先连接内逐出最旧，持续病态升级内部检疫；明确超限绝不注入线上 RST（红线三理由）；L3 升级为连接感知逐出。
+> v0.3 变更：P2 批量原子性落地——`RECORD_TS` 写入提前至 P2（第 9 个 DBI，作为逐条确定性索引锚点/回放收敛依据，查询消费仍留 P3.5）；SQLite 水位线同步策略拍板（常规 NORMAL + 文件边界屏障 durable + hot 截断到水位线重启规则）。
 > 本文档把架构设计翻译为**可下发的工程实施说明书**：依赖选型 → Crate 结构与职责 → 二进制数据规格 → 核心算法伪代码 → 状态机规格 → 测试清单 → 分阶段里程碑 → 风险与验收。
 
 ---
@@ -26,7 +27,7 @@
 | 加密 | `chacha20poly1305 = "0.10"` | 与 slimSync 对称 |
 | 序列化 | 键：byteorder 手写大端；值：定长结构体手写 / `bincode = "1.3"`（变长 QRPAIR） | 零序列化拷贝优先（mmap 直读定长结构） |
 | 其他 | `tokio`(full)、`clap`(derive)、`anyhow`、`tracing`、`serde`、`serde_json`、`hex`、`crc32fast`、`pcap-file="2"` | — |
-| Hash | 连接键先用 `fnv-1a-64`（零依赖），性能不足换 `xxhash-rust` | 同一哈希在 8 个 DBI 间一致 |
+| Hash | 连接键先用 `fnv-1a-64`（零依赖），性能不足换 `xxhash-rust` | 同一哈希在 9 个 DBI 间一致 |
 
 **版本红线**：与 `e2e-tools/Cargo.lock`、`slimSync/Cargo.lock` 已锁定版本对齐，避免协议/依赖分叉。
 
@@ -51,7 +52,7 @@ sovVault/
 │   ├── qr.rs                      # QrPair 实体 + 累积ACK消费匹配（快/慢路径、批量ACK聚合）
 │   ├── meta.rs                    # MetaRegistry + Fingerprint + Extractor + ExtMetaBind（伪KEY）
 │   ├── anomaly.rs                 # AnomalyKind + AnomalyEvent + 聚合计数（只计数不逐条落库）
-│   ├── db.rs                      # 8 DBI 句柄 + 键值编解码（db/ 子模块可拆）
+│   ├── db.rs                      # 9 DBI 句柄 + 键值编解码（db/ 子模块可拆）
 │   ├── ledger.rs                  # SQLite 管理平面（files/anomalies/ext_meta/meta_binds + 水位线）
 │   ├── batch.rs                   # BatchCommit 提交协议（LMDB先行→SQLite殿后→游标推进）
 │   ├── quarantine.rs              # L1/L2.5 连接检疫（ABORTED_RESOURCE）+ CONN_QR_FLOOD/CONN_OOO_FLOOD
@@ -79,7 +80,7 @@ IDX(u64) = (FILE_ID:u32 as u64) << 32 | (OFFSET:u32 as u64)     // 大端存 LMD
 硬不变量：单文件 ≤4GB；OFFSET=记录起始字节偏移。
 ```
 
-### 4.2 8 DBI 键值布局（键一律大端）
+### 4.2 9 DBI 键值布局（键一律大端）
 
 | DBI | Key | Value |
 |---|---|---|
@@ -91,8 +92,10 @@ IDX(u64) = (FILE_ID:u32 as u64) << 32 | (OFFSET:u32 as u64)     // 大端存 LMD
 | `QR_TIME` | `q_ts:u64` \| `q_first_idx:u64` | status:u8 |
 | `PACKET_QR` | `packet_idx:u64` | q_first_idx:u64 |
 | `PENDING_TTL` | `q_ts:u64` \| `conn_hash:u64` | q_first_idx:u64 \| abs_q_end:u64 |
+| `RECORD_TS` | `ts_ns:u64` \| `packet_idx:u64` | 紧凑摘要：proto:u8 \| flags:u8 \| src_ip:u32 \| dst_ip:u32 \| sport:u16 \| dport:u16 \| len:u32（18B） |
 
 > `status` 枚举：0=PENDING 1=MATCHED 2=TIMEOUT 3=UNMATCHED 4=RST_ABORT 5=ABORTED_RESOURCE。
+> **v0.3 决策**：`RECORD_TS` 的**写入**提前至 P2（作为逐条确定性索引锚点，支撑批量原子性与回放收敛断言）；其**查询/导出消费层**仍在 P3.5 落地（原决议不变）。
 
 ### 4.3 ConnState 定长 Value（内存布局，字段自大至小防 padding 浪费）
 
@@ -189,6 +192,13 @@ fn process_batch(recs: &[WalRecord], env: &LmdbEnv, sql: &mut SqliteLedger) -> R
 }
 // 失败路径：txn.abort()/sql.rollback() → 丢弃内存态 → 日志 → 下轮从原水位线重放（幂等自愈）
 ```
+
+**SQLite 水位线同步策略（v0.3 拍板）**：
+- 常规批次：`WAL + synchronous=NORMAL`（不逐提交 fsync，吞吐优先）。
+- **正确性论证**：SQLite 是"殿后"，**永不越过已落盘的 LMDB 提交**；唯一失败方向是"水位线落后"→ 重放幂等收敛。故逐提交 FULL 无正确性收益，只付吞吐代价。
+- **文件边界屏障处升级 durable**：切换文件时 `synchronous=FULL` 提交 + 数据平面文件 `sync_all()`，把"本文件 100% 已入库"固化，杜绝重启后跨文件消费。
+- **不与物理 Close 挂钩**：Close 仅句柄动作，锚定语义是"文件边界"（切换时顺带触发旧文件 Close：先 flush 数据 → durable 水位线 → 再切句柄）。
+- **崩溃重启规则**：hot 文件**截断到 SQLite 水位线**（数据平面写入无事务性，未提交尾部必须丢弃），再重放。
 
 ### 5.3 累积 ACK 消费（R 到达）
 
@@ -299,7 +309,7 @@ fn on_ooo_overflow(conn, txn) {
 | qr.rs | 精确匹配；批量 ACK 聚合单 QRPAIR；跨批（写 LMDB 后新事务消费）；回绕；tolerance 边界；RST 级联；检疫 |
 | connection | 状态机迁移；方向计数；conn_hash 稳定 |
 | meta | HTTP/TLS/DNS/JSON 指纹；伪 KEY 稳定性（同签名同 KEY） |
-| db.rs | 8 DBI 键值编解码往返 |
+| db.rs | 9 DBI 键值编解码往返 |
 | ledger.rs | DDL 建表；files/水位线/异常幂等重入 |
 
 ### 8.2 集成测试
@@ -318,9 +328,9 @@ VM-1：sovProbe + slimSync；VM-2：sovVault。断言：重组 MD5 与源段 100
 
 | 阶段 | 任务 | 交付 | 验收 | 估时 |
 |---|---|---|---|---|
-| P0 | 三平面骨架：File 分层 + SQLite DDL + LMDB 8 DBI + IDX/conn_hash | 可建库可读写 | IDX 往返、8 DBI 编解码单测绿 | 2d |
+| P0 | 三平面骨架：File 分层 + SQLite DDL + LMDB 8 DBI（P2 扩至 9）+ IDX/conn_hash | 可建库可读写 | IDX 往返、8 DBI 编解码单测绿 | 2d |
 | P1 | 重组底座：解密/落位/段状态机/四重校验/Gap 自愈 + L2/L3/L2.5 预算 | Reassembler + walscan | §8.1 reassembly 全绿 | 3d |
-| P2 | 批量原子性：BatchCommit 提交协议 + 回放自愈 | batch.rs | §8.2 atomicity 绿 | 2d |
+| P2 | 批量原子性：BatchCommit 提交协议（①LMDB→②SQLite→③游标）+ 文件边界屏障 + RECORD_TS 写入 + 崩溃窗口重放自愈 | batch.rs + db.rs（第 9 DBI） | §8.2 atomicity 绿（含崩溃模拟单测） | 2d |
 | P3 | QR 匹配：SeqStream + 累积ACK消费 + 快/慢路径 + 聚合 + 连接状态机 | seq.rs/qr.rs/connection.rs | §8.1 qr 全绿 | 3d |
 | P3.5 | 查询索引：CONN_QR/QR_TIME/PACKET_QR/RECORD_TS + 单 CONN 检索链路 | db.rs 扩充 + query.rs | 单 CONN 查询毫秒级；IDX 反查命中 | 2d |
 | P4 | 异常与慢路径：RST 级联 + 只计数 + FIN 缩短超时 + TTL + 检疫 | anomaly/quarantine | §8.1 异常用例绿；RST 不等超时 | 2d |

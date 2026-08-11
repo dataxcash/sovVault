@@ -1,6 +1,6 @@
-# sovVault 设计与实施方案（评审稿 v0.5）
+# sovVault 设计与实施方案（评审稿 v0.6）
 
-> 状态：**待评审** | 版本：v0.5 | 所属：IronSovereign 开源底座（datax.cash）
+> 状态：**待评审** | 版本：v0.6 | 所属：IronSovereign 开源底座（datax.cash）
 > 本文档定义存储中枢 **sovVault**：Zenoh 字节流 → 重组解密 → TCP 连接/QR 对匹配 → 分级存储 → 司法级导出与查询。
 >
 > **v0.2 修订（响应评审①）：**
@@ -23,6 +23,10 @@
 > 2. **逐级响应**：超限先**连接内逐出最旧**（置 `SEQ_GAP` → GapQuery 回源自愈，数据平面照常落盘）；窗口（`conn_evict_window_secs`）内持续耗尽（`conn_evict_threshold` 次）升级**内部检疫**（`CONN_OOO_FLOOD`，语义同 L1）。
 > 3. **L3 升级连接感知逐出**：全局兜底优先清已检疫/标记连接缓存，无辜连接最后碰。
 > 4. **超限"强 RST"明确否决（红线三理由）**：旁路带外被动探针不扰动生产 / RST 可伪造会被恶意者利用成攻击面 / 恶意连接两端皆受控、注入 RST 零收益。
+>
+> **v0.6 修订（P2 批量原子性落地）：**
+> 1. **DBI 8 → 9**：`RECORD_TS` 写入提前至 P2（逐条确定性索引锚点，支撑批量原子性与回放收敛）；查询消费层仍在 P3.5。
+> 2. **SQLite 水位线同步策略**：常规批次 `synchronous=NORMAL`；文件边界屏障处升级 durable（FULL + 数据平面 `sync_all`），固化"本文件 100% 已入库"；崩溃重启把 hot 文件截断到水位线后重放。
 
 ---
 
@@ -61,7 +65,7 @@
         │                 │                   │
         ▼                 ▼                   ▼
    [ FILE 数据平面 ]  [ LMDB 索引平面 ]   [ SQLite 管理平面 ]
-   hot/warm *.wal      8 个 DBI            files 文件清单
+   hot/warm *.wal      9 个 DBI            files 文件清单
    *.pcap(经典格式)    见 §四               analysis_watermark
                                            lmdb_env 实例信息
                                            anomalies 审计
@@ -92,7 +96,7 @@ IDX (u64) = (FILE_ID : u32) << 32 | (FILE_OFFSET : u32)
 
 ---
 
-## 四、LMDB DBI Schema（键一律大端，共 8 个 DBI）
+## 四、LMDB DBI Schema（键一律大端，共 9 个 DBI）
 
 ### 4.0 绝对序列号流翻译器（QR 匹配的回绕根治）★
 
@@ -192,8 +196,9 @@ Value: q_first_idx: u64 | abs_q_end: u48
 ### 4.9 DBI_RECORD_TS — 报文时间窗索引（PCAP 导出）
 ```
 Key:   [ts_ns: u64][packet_idx: u64]
-Value: 紧凑摘要（proto|flags|src_ip|dst_ip|sport|dport|len）
+Value: 紧凑摘要（proto|flags|src_ip|dst_ip|sport|dport|len，18B）
 ```
+> **v0.6 决策**：`RECORD_TS` 的**写入**提前至 P2（第 9 个 DBI）——作为批量原子性/回放收敛的逐条确定性索引锚点；PCAP 导出等**查询消费层**仍在 P3.5 落地。
 PCAP 导出 = 时间窗游标 + **内存 BPF 过滤**（流式，免索引爆炸）。指定五元组高频查询可追加规范化前缀索引（阶段二可选）。
 
 ---
@@ -374,7 +379,7 @@ struct ConnState { state, 5-tuple, counters, abs_seq_c/s, consumed_ack_c/s,
 // —— 连接级 OOO 字节预算（L2.5，见 §5.7） ——
 struct ConnOOOBudget { used_bytes: u64, evict_streak: u32, window_start: u64 }
 
-// 8 个 DBI 句柄常量 + 批量提交
+// 9 个 DBI 句柄常量 + 批量提交
 struct BatchCommit { lmdb_txn, files_watermark: Vec<(file_id, analysis_offset)> }
 // 提交协议：lmdb.commit() 成功 → sqlite 水位线事务 → 推进内存游标
 ```
@@ -425,7 +430,7 @@ fin_short_timeout_secs = 5  # FIN 半关闭后未决 Q 缩短超时
 |---|---|---|
 | P0 存储三平面 | File 分层 + SQLite files/水位线/审计/ext_meta + LMDB 8 DBI 骨架 | IDX 编码往返；三平面落位 |
 | P1 重组底座 | 解密+乱序落位+段状态机+四重校验+Gap 自愈+**L2 单段/L2.5 单连接/L3 全局乱序预算与段检疫** | 单测：乱序/幂等/缺口/脏尾/预算超限检疫全绿 |
-| P2 批量原子性 | Batch=一个 LMDB 事务；LMDB 先行/SQLite 殿后；文件边界屏障；确定性 q_first_idx + 重放自愈 | 注入提交失败 → 水位线不动、重放收敛 |
+| P2 批量原子性 | Batch=一个 LMDB 事务；LMDB 先行/SQLite 殿后；文件边界屏障；确定性主键 + MDB_NOOVERWRITE 重放自愈；hot 截断到水位线重启规则 | 注入提交失败 → 水位线不动、重放收敛（崩溃窗口模拟单测） |
 | P3 QR 匹配 | 绝对 SEQ 翻译器 + 累积 ACK 消费 + 快/慢路径 + 批量 ACK 聚合 + 连接状态机（同事务） | 握手+管道化+跨批响应+回绕用例断言 QRPair |
 | P3.5 查询索引 | DBI_CONN_QR / DBI_QR_TIME / DBI_PACKET_QR / DBI_RECORD_TS + 单 CONN 检索链路 | 单 CONN 查询毫秒级；报文 IDX 反查命中 |
 | P4 异常与慢路径 | RST 级联熔断 + DUP/SEQ_GAP/ZERO_WIN 只计数 + FIN 缩短超时 + TTL 扫描 + SQLite 审计锚定 IDX + **L1/L2.5 连接检疫（ABORTED_RESOURCE）** | 异常可统计可回跳原文；RST 不等待超时；恶意发包只烧自己预算、不误伤无辜 |

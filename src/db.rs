@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions};
+use heed::{Database, Env, EnvOpenOptions, MdbError, PutFlags};
 use std::path::Path;
 
 /// 8 DBI 名称（09 §4.2 表格顺序）。
@@ -15,8 +15,11 @@ pub const DBI_QR_KEY: &str = "qr_key";
 pub const DBI_QR_TIME: &str = "qr_time";
 pub const DBI_PACKET_QR: &str = "packet_qr";
 pub const DBI_PENDING_TTL: &str = "pending_ttl";
+/// 报文时间窗索引（09 §4.9）。P2 起作为逐条确定性索引锚点（批量原子性/回放收敛依据），
+/// P3.5 补齐查询/导出消费层。
+pub const DBI_RECORD_TS: &str = "record_ts";
 
-pub const NUM_DBIS: usize = 8;
+pub const NUM_DBIS: usize = 9;
 const DBI_NAMES: [&str; NUM_DBIS] = [
     DBI_CONN_STATE,
     DBI_QR_PAIR,
@@ -26,7 +29,19 @@ const DBI_NAMES: [&str; NUM_DBIS] = [
     DBI_QR_TIME,
     DBI_PACKET_QR,
     DBI_PENDING_TTL,
+    DBI_RECORD_TS,
 ];
+
+/// DBI 数组下标（与 DBI_NAMES 对齐）。
+pub const IDX_CONN_STATE: usize = 0;
+pub const IDX_QR_PAIR: usize = 1;
+pub const IDX_QR_PENDING: usize = 2;
+pub const IDX_CONN_QR: usize = 3;
+pub const IDX_QR_KEY: usize = 4;
+pub const IDX_QR_TIME: usize = 5;
+pub const IDX_PACKET_QR: usize = 6;
+pub const IDX_PENDING_TTL: usize = 7;
+pub const IDX_RECORD_TS: usize = 8;
 
 /// QrStatus 枚举（09 §4.2，跨 DBI 一致）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -154,6 +169,53 @@ pub fn k_pending_ttl(q_ts: u64, conn_hash: u64) -> Vec<u8> {
     put_u64(&mut v, q_ts);
     put_u64(&mut v, conn_hash);
     v
+}
+
+/// RECORD_TS：[ts_ns:u64][packet_idx:u64]（定长 16B）。
+pub fn k_record_ts(ts_ns: u64, packet_idx: u64) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[0..8].copy_from_slice(&ts_ns.to_be_bytes());
+    k[8..16].copy_from_slice(&packet_idx.to_be_bytes());
+    k
+}
+
+/// RECORD_TS Value：紧凑摘要（09 §4.9）proto|flags|src_ip|dst_ip|sport|dport|len（18B）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RecordSummary {
+    pub proto: u8,
+    pub flags: u8,
+    pub src_ip: u32,
+    pub dst_ip: u32,
+    pub sport: u16,
+    pub dport: u16,
+    pub len: u32,
+}
+
+pub fn v_record_summary_encode(s: &RecordSummary) -> [u8; 18] {
+    let mut v = [0u8; 18];
+    v[0] = s.proto;
+    v[1] = s.flags;
+    v[2..6].copy_from_slice(&s.src_ip.to_be_bytes());
+    v[6..10].copy_from_slice(&s.dst_ip.to_be_bytes());
+    v[10..12].copy_from_slice(&s.sport.to_be_bytes());
+    v[12..14].copy_from_slice(&s.dport.to_be_bytes());
+    v[14..18].copy_from_slice(&s.len.to_be_bytes());
+    v
+}
+
+pub fn v_record_summary_decode(b: &[u8]) -> Option<RecordSummary> {
+    if b.len() != 18 {
+        return None;
+    }
+    Some(RecordSummary {
+        proto: b[0],
+        flags: b[1],
+        src_ip: u32::from_be_bytes(b[2..6].try_into().ok()?),
+        dst_ip: u32::from_be_bytes(b[6..10].try_into().ok()?),
+        sport: u16::from_be_bytes(b[10..12].try_into().ok()?),
+        dport: u16::from_be_bytes(b[12..14].try_into().ok()?),
+        len: u32::from_be_bytes(b[14..18].try_into().ok()?),
+    })
 }
 
 // --- QR_PENDING Value：q_first_idx:u64 | q_ts:u64 | q_len:u32 ---
@@ -366,6 +428,21 @@ impl DbRegistry {
     }
 }
 
+/// NO_OVERWRITE 幂等写入：键已存在（KeyExist）返回 Ok(false)，否则写入返回 Ok(true)。
+/// 回放自愈的核心机制——确定性主键下重放同批记录收敛、零脏数据。
+pub fn put_no_overwrite(
+    db: &Database<Bytes, Bytes>,
+    txn: &mut heed::RwTxn<'_>,
+    key: &[u8],
+    value: &[u8],
+) -> Result<bool> {
+    match db.put_with_flags(txn, PutFlags::NO_OVERWRITE, key, value) {
+        Ok(()) => Ok(true),
+        Err(heed::Error::Mdb(MdbError::KeyExist)) => Ok(false),
+        Err(e) => Err(e.into()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,6 +534,44 @@ mod tests {
 
         // 截断必须拒绝（防越界读取）。
         assert!(QrPairValue::decode(&enc[..enc.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn record_ts_codec() {
+        let k = k_record_ts(123456789, 0x1122_3344_5566_7788);
+        assert_eq!(k.len(), 16);
+        assert_eq!(&k[0..8], &123456789u64.to_be_bytes());
+        assert_eq!(&k[8..16], &0x1122_3344_5566_7788u64.to_be_bytes());
+
+        let s = RecordSummary {
+            proto: 6,
+            flags: 0x12,
+            src_ip: 0xC0A8_0001,
+            dst_ip: 0x0A00_0002,
+            sport: 12345,
+            dport: 443,
+            len: 1024,
+        };
+        let enc = v_record_summary_encode(&s);
+        assert_eq!(enc.len(), 18);
+        assert_eq!(v_record_summary_decode(&enc).unwrap(), s);
+        assert!(v_record_summary_decode(&enc[..17]).is_none());
+    }
+
+    #[test]
+    fn put_no_overwrite_idempotent() {
+        let dir = tmpdir("nooverwrite");
+        let reg = DbRegistry::open(&dir, 10 * 1024 * 1024).unwrap();
+        let mut txn = reg.write_txn().unwrap();
+        let k = k_record_ts(1, 2);
+        let v = v_record_summary_encode(&RecordSummary::default());
+        // 首次写入 → true；同键重复写入 → false（幂等收敛依据）。
+        assert!(put_no_overwrite(&reg.dbs[IDX_RECORD_TS], &mut txn, &k, &v).unwrap());
+        assert!(!put_no_overwrite(&reg.dbs[IDX_RECORD_TS], &mut txn, &k, &v).unwrap());
+        txn.commit().unwrap();
+        let txn = reg.read_txn().unwrap();
+        assert_eq!(reg.dbs[IDX_RECORD_TS].len(&txn).unwrap(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

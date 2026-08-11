@@ -13,6 +13,15 @@ pub enum FileKind {
     Pcap = 1,
 }
 
+/// OPEN 状态 hot 文件记录（重启恢复）。
+#[derive(Debug, Clone)]
+pub struct OpenFileRec {
+    pub file_id: i64,
+    pub path: String,
+    pub watermark: u64,
+    pub segment_seq: Option<i64>,
+}
+
 /// files.state：0=OPEN 1=SEALED 2=ARCHIVED。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(i64)]
@@ -130,6 +139,25 @@ impl Ledger {
             params![file_id, state as i64],
         )?;
         Ok(())
+    }
+
+    /// 查询某 dev 最新的 OPEN 状态 hot 文件（崩溃重启恢复依据）。
+    pub fn open_file_for_dev(&self, dev_id: i64) -> Result<Option<OpenFileRec>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT file_id, path, analysis_offset, segment_seq
+             FROM files WHERE dev_id = ?1 AND state = 0 ORDER BY file_id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query(params![dev_id])?;
+        if let Some(row) = rows.next()? {
+            Ok(Some(OpenFileRec {
+                file_id: row.get(0)?,
+                path: row.get(1)?,
+                watermark: row.get::<_, i64>(2)? as u64,
+                segment_seq: row.get(3)?,
+            }))
+        } else {
+            Ok(None)
+        }
     }
 
     /// 归档/校验元数据更新（size/sha256/首末时间）。
