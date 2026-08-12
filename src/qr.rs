@@ -25,6 +25,7 @@ use crate::db::{
     k_record_ts,
 };
 use crate::ledger::AnomalyEvent;
+use crate::anomaly::{ANOM_QR_RST_ABORT, ANOM_QR_UNMATCHED};
 use anyhow::Result;
 use heed::types::Bytes;
 use heed::Database;
@@ -42,9 +43,8 @@ pub const U48_MAX: u64 = 0x0000_FFFF_FFFF_FFFF;
 /// 防止幽灵 ack 把新代际的 consumed 抬高后误压真实新 Q。
 pub const ACK_LEAD_CAP: u64 = 1 << 26;
 
-/// 审计异常种类（P3 引入；P4 汇总扩展）。
-pub const ANOM_EPOCH_REBIRTH: i64 = 10;
-pub const ANOM_CONN_RST: i64 = 11;
+/// 审计异常种类（定义在 anomaly.rs，此处 re-export 保持旧引用兼容）。
+pub use crate::anomaly::{ANOM_CONN_RST, ANOM_EPOCH_REBIRTH};
 
 /// QR 匹配参数（来自 config.analysis）。
 #[derive(Debug, Clone, Copy)]
@@ -524,6 +524,16 @@ impl<'e> QrMatcher<'e> {
         let hits = self.scan_pending_upto(h, old_inc, U48_MAX)?;
         for hit in &hits {
             self.flip_pair_status(hit.q_first_idx, QrStatus::Unmatched)?;
+            // P4：终态事件逐 Q 串接审计台账（可回跳原文，不丢失基因锚）。
+            self.anomalies.push(AnomalyEvent {
+                ts: rec.timestamp_ns as i64,
+                kind: ANOM_QR_UNMATCHED,
+                dev_id: None,
+                segment_seq: None,
+                conn_hash: Some(h.to_be_bytes().to_vec()),
+                qr_id: Some(hit.q_first_idx as i64),
+                detail: Some(format!("epoch={} gen_flip", old_inc)),
+            });
             let dpp = self.dbs[IDX_QR_PENDING];
             dpp.delete(&mut self.txn, &hit.key)?;
             let dtt = self.dbs[IDX_PENDING_TTL];
@@ -532,6 +542,9 @@ impl<'e> QrMatcher<'e> {
 
         let st = &mut self.conns.get_mut(&h).unwrap().state;
         st.incarnation = st.incarnation.wrapping_add(1);
+        // P4 修复：旧代际 PENDING 已全量清退，qr_open（L1 预算/审计口径）必须归零，
+        // 否则跨代际累积虚高 → 新代际无辜触发 CONN_QR_FLOOD 内部检疫。
+        st.qr_open = 0;
         // 新代际 SYN 标识：SYN 触发 → 本报文；裸跳变触发 → 0（无 SYN 建立）。
         st.syn_pkt_idx = if rec.tcp_flags & TCP_SYN != 0 {
             syn_idx
@@ -581,6 +594,16 @@ impl<'e> QrMatcher<'e> {
         let hits = self.scan_pending_upto(h, inc, U48_MAX)?;
         for hit in &hits {
             self.flip_pair_status(hit.q_first_idx, QrStatus::RstAbort)?;
+            // P4：终态事件逐 Q 串接审计台账。
+            self.anomalies.push(AnomalyEvent {
+                ts: rec.timestamp_ns as i64,
+                kind: ANOM_QR_RST_ABORT,
+                dev_id: None,
+                segment_seq: None,
+                conn_hash: Some(h.to_be_bytes().to_vec()),
+                qr_id: Some(hit.q_first_idx as i64),
+                detail: Some(format!("inc={} rst_cascade", inc)),
+            });
             let dpp = self.dbs[IDX_QR_PENDING];
             dpp.delete(&mut self.txn, &hit.key)?;
             let dtt = self.dbs[IDX_PENDING_TTL];
@@ -621,15 +644,7 @@ impl<'e> QrMatcher<'e> {
         q_first_idx: u64,
         status: QrStatus,
     ) -> Result<()> {
-        let kh = crate::connection::fnv1a64(&pair.req_key);
-        let s = v_status_encode(status);
-        let d1 = self.dbs[IDX_CONN_QR];
-        d1.put(&mut self.txn, &k_conn_qr(pair.conn_hash, pair.q_ts, q_first_idx), &s)?;
-        let d2 = self.dbs[IDX_QR_KEY];
-        d2.put(&mut self.txn, &k_qr_key(kh, pair.q_ts, q_first_idx), &s)?;
-        let d3 = self.dbs[IDX_QR_TIME];
-        d3.put(&mut self.txn, &k_qr_time(pair.q_ts, q_first_idx), &s)?;
-        Ok(())
+        write_secondary_status(&self.dbs, &mut self.txn, pair, q_first_idx, status)
     }
 
     /// 范围扫描 [conn][inc] 前缀下 abs_q_end ≤ limit 的全部 PENDING。
@@ -673,6 +688,24 @@ impl<'e> QrMatcher<'e> {
 fn req_key_of(rec: &WalRecord) -> Vec<u8> {
     let n = rec.payload.len().min(32);
     rec.payload[..n].to_vec()
+}
+
+/// 次级索引状态写（CONN_QR / QR_KEY / QR_TIME，同 txn 软缓存一致）。
+/// 与 QrMatcher::ingest 同一事务内的 Q 翻转 / RST 级联 / 代际翻转 / P4 TTL 扫描共用，
+/// 保证三个状态索引与 QRPAIR 主行永不漂移。
+pub(crate) fn write_secondary_status(
+    dbs: &[Database<Bytes, Bytes>; NUM_DBIS],
+    txn: &mut heed::RwTxn<'_>,
+    pair: &QrPairValue,
+    q_first_idx: u64,
+    status: QrStatus,
+) -> Result<()> {
+    let kh = crate::connection::fnv1a64(&pair.req_key);
+    let s = v_status_encode(status);
+    dbs[IDX_CONN_QR].put(txn, &k_conn_qr(pair.conn_hash, pair.q_ts, q_first_idx), &s)?;
+    dbs[IDX_QR_KEY].put(txn, &k_qr_key(kh, pair.q_ts, q_first_idx), &s)?;
+    dbs[IDX_QR_TIME].put(txn, &k_qr_time(pair.q_ts, q_first_idx), &s)?;
+    Ok(())
 }
 
 #[cfg(test)]

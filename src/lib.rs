@@ -1,5 +1,6 @@
 //! sovVault 存储中枢库：模块声明与流水线编排入口。
 
+pub mod anomaly;
 pub mod batch;
 pub mod config;
 pub mod connection;
@@ -9,6 +10,7 @@ pub mod id;
 pub mod ingest;
 pub mod ledger;
 pub mod qr;
+pub mod query;
 pub mod reassembly;
 pub mod util;
 pub mod walscan;

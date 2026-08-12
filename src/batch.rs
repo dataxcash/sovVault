@@ -91,7 +91,7 @@ pub fn stage_sqlite(ledger: &Ledger, records: &[IndexedRecord]) -> Result<()> {
 }
 
 /// 完整提交协议：① LMDB 先行 → ② SQLite 殿后 →（③ 游标推进由调用方执行）。
-/// 审计事件（低频）best-effort 落库，不阻塞提交协议。
+/// 审计事件（低频）best-effort 落库（单事务批量），不阻塞提交协议。
 pub fn commit_batch(
     reg: &DbRegistry,
     ledger: &Ledger,
@@ -100,10 +100,8 @@ pub fn commit_batch(
 ) -> Result<Vec<AnomalyEvent>> {
     let anomalies = stage_lmdb(reg, records, params)?;
     stage_sqlite(ledger, records)?;
-    for a in &anomalies {
-        if let Err(e) = ledger.insert_anomaly(a) {
-            tracing::warn!("审计事件入库失败: {}", e);
-        }
+    if let Err(e) = ledger.insert_anomalies(&anomalies) {
+        tracing::warn!("审计事件入库失败: {}", e);
     }
     Ok(anomalies)
 }

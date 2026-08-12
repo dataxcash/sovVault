@@ -2,7 +2,7 @@
 //! DDL 对齐 09_sovVault_实施方案.md §4.4。
 
 use anyhow::Result;
-use rusqlite::{params, Connection};
+use rusqlite::{params, params_from_iter, Connection};
 use std::path::Path;
 
 /// files.kind：0=WAL 1=PCAP。
@@ -32,7 +32,7 @@ pub enum FileState {
 }
 
 /// 审计异常事件（低频，逐条可查可回跳原文）。
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct AnomalyEvent {
     pub ts: i64,
     pub kind: i64,
@@ -192,6 +192,118 @@ impl Ledger {
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
+    }
+
+    /// 批量审计入库（单事务；P4 终态事件族——TTL 扫描逐 Q 落库走此路径）。
+    /// 使用 `unchecked_transaction`（&self）：Ledger 单连接、调用方串行，无嵌套事务风险。
+    pub fn insert_anomalies(&self, events: &[AnomalyEvent]) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO anomalies(ts, kind, dev_id, segment_seq, conn_hash, qr_id, detail)
+                 VALUES(?1,?2,?3,?4,?5,?6,?7)",
+            )?;
+            for e in events {
+                stmt.execute(params![
+                    e.ts,
+                    e.kind,
+                    e.dev_id,
+                    e.segment_seq,
+                    e.conn_hash.as_deref(),
+                    e.qr_id,
+                    e.detail.as_deref()
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    /// 异常聚合（只计数，按 kind 分组；时间窗可选）。
+    /// 返回 (kind, count)，kind 升序。
+    pub fn anomaly_summary(
+        &self,
+        start: Option<i64>,
+        end: Option<i64>,
+    ) -> Result<Vec<(i64, i64)>> {
+        let mut conds: Vec<&str> = Vec::new();
+        let mut pvals: Vec<i64> = Vec::new();
+        if let Some(s) = start {
+            conds.push("ts >= ?");
+            pvals.push(s);
+        }
+        if let Some(e) = end {
+            conds.push("ts <= ?");
+            pvals.push(e);
+        }
+        let where_clause = if conds.is_empty() {
+            String::new()
+        } else {
+            format!("WHERE {}", conds.join(" AND "))
+        };
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT kind, COUNT(*) c FROM anomalies {} GROUP BY kind ORDER BY kind",
+            where_clause
+        ))?;
+        let rows = stmt.query_map(params_from_iter(pvals), |r| Ok((r.get(0)?, r.get(1)?)))?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// 异常回跳查询（终态事件逐 Q 可回跳原文；kind/时间窗/limit 过滤，按 id 倒序）。
+    pub fn query_anomalies(
+        &self,
+        kind: Option<i64>,
+        start: Option<i64>,
+        end: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<AnomalyEvent>> {
+        let mut sql = String::from(
+            "SELECT ts, kind, dev_id, segment_seq, conn_hash, qr_id, detail FROM anomalies",
+        );
+        let mut conds: Vec<String> = Vec::new();
+        let mut pvals: Vec<i64> = Vec::new();
+        if let Some(k) = kind {
+            conds.push("kind = ?".into());
+            pvals.push(k);
+        }
+        if let Some(s) = start {
+            conds.push("ts >= ?".into());
+            pvals.push(s);
+        }
+        if let Some(e) = end {
+            conds.push("ts <= ?".into());
+            pvals.push(e);
+        }
+        if !conds.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conds.join(" AND "));
+        }
+        sql.push_str(" ORDER BY id DESC LIMIT ?");
+        pvals.push(limit as i64);
+        let mut stmt = self.conn.prepare(&sql)?;
+        let rows = stmt.query_map(params_from_iter(pvals), |r| {
+            Ok(AnomalyEvent {
+                ts: r.get(0)?,
+                kind: r.get(1)?,
+                dev_id: r.get(2)?,
+                segment_seq: r.get(3)?,
+                conn_hash: r.get::<_, Option<Vec<u8>>>(4)?,
+                qr_id: r.get(5)?,
+                detail: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 
     /// ext_meta 注册（连接 ↔ 协议元数据指纹）。

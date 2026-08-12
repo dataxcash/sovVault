@@ -6,7 +6,7 @@ const FNV1A64_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
 /// FNV-1a 64 位素因子。
 const FNV1A64_PRIME: u64 = 0x0000_0100_0000_01b3;
 
-/// fnv1a64（同一哈希在 8 个 DBI 间一致）。
+/// fnv1a64（同一哈希在 9 个 DBI 间一致）。
 pub fn fnv1a64(data: &[u8]) -> u64 {
     let mut h = FNV1A64_OFFSET;
     for &b in data {

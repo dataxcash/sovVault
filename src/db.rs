@@ -1,4 +1,4 @@
-//! LMDB 索引平面：8 DBI 注册表 + 键值大端编解码。
+//! LMDB 索引平面：9 DBI 注册表 + 键值大端编解码。
 //! 键值规格对齐 09_sovVault_实施方案.md §4.2（键一律大端）。
 
 use anyhow::Result;
@@ -44,7 +44,7 @@ pub const IDX_PENDING_TTL: usize = 7;
 pub const IDX_RECORD_TS: usize = 8;
 
 /// QrStatus 枚举（09 §4.2，跨 DBI 一致）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[repr(u8)]
 pub enum QrStatus {
     Pending = 0,
@@ -64,6 +64,31 @@ impl QrStatus {
             3 => Some(QrStatus::Unmatched),
             4 => Some(QrStatus::RstAbort),
             5 => Some(QrStatus::AbortedResource),
+            _ => None,
+        }
+    }
+
+    /// 稳定字面名（P3.5 查询/导出使用）。
+    pub fn name(self) -> &'static str {
+        match self {
+            QrStatus::Pending => "pending",
+            QrStatus::Matched => "matched",
+            QrStatus::Timeout => "timeout",
+            QrStatus::Unmatched => "unmatched",
+            QrStatus::RstAbort => "rst_abort",
+            QrStatus::AbortedResource => "aborted_resource",
+        }
+    }
+
+    /// CLI 过滤解析。
+    pub fn parse(s: &str) -> Option<QrStatus> {
+        match s {
+            "pending" => Some(QrStatus::Pending),
+            "matched" => Some(QrStatus::Matched),
+            "timeout" => Some(QrStatus::Timeout),
+            "unmatched" => Some(QrStatus::Unmatched),
+            "rst_abort" | "rst" => Some(QrStatus::RstAbort),
+            "aborted_resource" | "aborted" => Some(QrStatus::AbortedResource),
             _ => None,
         }
     }
@@ -199,7 +224,7 @@ pub fn k_record_ts(ts_ns: u64, packet_idx: u64) -> [u8; 16] {
 }
 
 /// RECORD_TS Value：紧凑摘要（09 §4.9）proto|flags|src_ip|dst_ip|sport|dport|len（18B）。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct RecordSummary {
     pub proto: u8,
     pub flags: u8,
@@ -305,7 +330,7 @@ pub fn v_pending_ttl_decode(b: &[u8]) -> Option<(u64, u64)> {
 
 // --- QR_PAIR Value（变长，09 §4.2） ---
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize)]
 pub struct QrPairValue {
     pub status: u8,
     pub conn_hash: u64,
@@ -406,7 +431,7 @@ impl QrPairValue {
     }
 }
 
-// --- LMDB 环境与 8 DBI 注册表 ---
+// --- LMDB 环境与 9 DBI 注册表 ---
 
 pub struct DbRegistry {
     env: Env,
