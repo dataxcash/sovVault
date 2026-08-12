@@ -304,6 +304,8 @@ pub struct BatchPipeline<'a> {
     pending: Vec<IndexedRecord>,
     batch_size: u32,
     analysis: QrParams,
+    /// P5：MetaRegistry（在线 ingest 路径传入，离线/压测路径可空）。
+    meta: Option<MetaRegistry>,
 }
 
 impl<'a> BatchPipeline<'a> {
@@ -326,7 +328,13 @@ impl<'a> BatchPipeline<'a> {
             pending: Vec::with_capacity(batch_size as usize),
             batch_size,
             analysis,
+            meta: None,
         })
+    }
+
+    /// 注入 P5 MetaRegistry（协议绑定 + EXT META 指纹提取）。
+    pub fn set_meta(&mut self, meta: MetaRegistry) {
+        self.meta = Some(meta);
     }
 
     pub fn push_record(&mut self, rec: WalRecord) -> Result<()> {
@@ -355,7 +363,11 @@ impl<'a> BatchPipeline<'a> {
             return Ok(());
         }
         let records = std::mem::take(&mut self.pending);
-        commit_batch(self.reg, self.ledger, &records, &self.analysis)?;
+        if let Some(meta) = &self.meta {
+            commit_batch_with_meta(self.reg, self.ledger, &records, &self.analysis, Some(meta))?;
+        } else {
+            commit_batch(self.reg, self.ledger, &records, &self.analysis)?;
+        }
         Ok(())
     }
 

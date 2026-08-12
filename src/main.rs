@@ -249,9 +249,18 @@ fn cmd_ingest(cfg: &Config, wal_dir: Option<std::path::PathBuf>) -> Result<()> {
 }
 
 /// P0/P4：三平面初始化验证 + 启动后台 TTL 扫描协程（常驻守护进程）。
+/// 若配置了 Zenoh 在线端点（connect/listen 非空），serve 演进为在线 ingest 常驻服务。
 fn cmd_serve(cfg: &Config) -> Result<()> {
     for d in [cfg.hot_dir(), cfg.warm_dir(), cfg.lmdb_dir()] {
         std::fs::create_dir_all(&d)?;
+    }
+
+    // 在线 ingest 路径：Zenoh 订阅 → 重组 → 批量落库（含 TTL 内联扫描）。
+    if !cfg.zenoh.connect.is_empty() || !cfg.zenoh.listen.is_empty() {
+        tracing::info!("serve: Zenoh 在线 ingest 模式（connect={:?}）", cfg.zenoh.connect);
+        let rt = tokio::runtime::Runtime::new()?;
+        rt.block_on(sov_vault::ingest::zenoh::run(cfg))?;
+        return Ok(());
     }
 
     let ledger = Ledger::open(&cfg.ledger_path())?;
@@ -259,7 +268,7 @@ fn cmd_serve(cfg: &Config) -> Result<()> {
     let reg = DbRegistry::open(&cfg.lmdb_dir(), map_size)?;
     let env_stat = reg.env().stat();
 
-    tracing::info!("sovVault 三平面就绪");
+    tracing::info!("sovVault 三平面就绪（离线骨架，无在线端点）");
     tracing::info!(
         "  数据平面: {} / {}",
         cfg.hot_dir().display(),

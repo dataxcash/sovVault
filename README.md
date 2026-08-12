@@ -78,7 +78,9 @@ cargo build --release
 # Initialize the three planes + register protocol bindings from config
 sovvault --config config.example.toml --root /var/lib/sovvault meta --register
 
-# Run the resident service (ingest + background TTL scan)
+```bash
+# Run the resident service (live Zenoh ingest + background TTL scan)
+# Requires [zenoh].connect/listen + [crypto].key_file matching slimSync.
 sovvault --config config.example.toml serve
 
 # Offline WAL ingest (report only in this milestone)
@@ -104,7 +106,7 @@ sovvault --config config.example.toml meta --list
 
 | Subcommand | Purpose |
 |---|---|
-| `serve` | Initialize the three planes, start the ingest pipeline and the background TTL scan coroutine |
+| `serve` | Resident service: initialize the three planes, start the **live Zenoh ingest** (online subscription) and the background TTL scan |
 | `ingest` | Offline WAL directory → quadruple-validation decode → scan report |
 | `export` | Forensic PCAP export over the `RECORD_TS` time cursor with in-memory BPF filter (`--proto --src-ip --dst-ip --sport --dport --flags`) |
 | `query` | Packet time-window query (`DBI_RECORD_TS`) |
@@ -179,7 +181,7 @@ src/
 ├── batch.rs       # 2PC-lite commit protocol + hot-file writer
 ├── export.rs      # forensic PCAP streaming export
 ├── query.rs       # four-dimensional query matrix + JSONL export
-└── ingest/        # offline WAL input (Zenoh live subscription: phase 2)
+└── ingest/          # offline WAL input + live Zenoh subscription (batch/segment/gap self-heal)
 tests/             # E2E acceptance suites
 doc/               # design & implementation specs (EN + 中文)
 ```
@@ -188,7 +190,8 @@ doc/               # design & implementation specs (EN + 中文)
 
 ## Roadmap
 
-- **Phase 2**: Parquet export (`parquet-export` feature), directed 5-tuple index (`DBI_RECORD_5TUPLE`), live Zenoh ingest, full L7 decoders.
+- **Phase 2**: Parquet export (`parquet-export` feature), directed 5-tuple index (`DBI_RECORD_5TUPLE`), full L7 decoders.
+- **Done**: live Zenoh ingest (`ingest/zenoh.rs`) — batch/chunk subscription, ChaCha20 decrypt, out-of-order reassembly, GapQuery self-heal, quadruple-validation WAL streaming, 2PC-lite batch commit.
 
 ## License
 

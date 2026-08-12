@@ -24,6 +24,9 @@ heed = "0.22.1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 # 传输解密（与 slimSync/e2e-tools 锁文件对齐 0.10）
 chacha20poly1305 = "0.10"
+# 在线 ingest：Zenoh 订阅（与 e2e-tools 锁文件对齐 1.9.0）+ tokio 运行时
+zenoh = "1.9.0"
+tokio = { version = "1", features = ["full"] }
 # 十六进制密钥
 hex = "0.4"
 # CLI 与配置
