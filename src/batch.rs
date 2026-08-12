@@ -16,6 +16,7 @@
 use crate::db::{DbRegistry, RecordSummary};
 use crate::id;
 use crate::ledger::{AnomalyEvent, FileKind, FileState, Ledger};
+use crate::meta::{ExtMetaEvent, MetaRegistry};
 use crate::qr::{QrMatcher, QrParams};
 use anyhow::{Context, Result};
 use sov_probe::wal::header::WalRecord;
@@ -67,11 +68,23 @@ pub fn stage_lmdb(
     records: &[IndexedRecord],
     params: &QrParams,
 ) -> Result<Vec<AnomalyEvent>> {
-    let mut m = QrMatcher::begin(reg, params)?;
+    stage_lmdb_with_meta(reg, records, params, None).map(|(a, _)| a)
+}
+
+/// P5：带 MetaRegistry 的 LMDB 阶段——连接绑定 + 协议键/伪键提取，返回 (审计事件, EXT META 指纹)。
+pub fn stage_lmdb_with_meta(
+    reg: &DbRegistry,
+    records: &[IndexedRecord],
+    params: &QrParams,
+    meta: Option<&MetaRegistry>,
+) -> Result<(Vec<AnomalyEvent>, Vec<ExtMetaEvent>)> {
+    let mut m = QrMatcher::begin_with_meta(reg, params, meta)?;
     for r in records {
         m.ingest(r)?;
     }
-    m.commit()
+    let ext_meta = m.ext_meta_events().to_vec();
+    let anomalies = m.commit()?;
+    Ok((anomalies, ext_meta))
 }
 
 /// ② SQLite 阶段：按文件聚合推进水位线（每文件取本批最大已提交字节边界）。
@@ -98,12 +111,35 @@ pub fn commit_batch(
     records: &[IndexedRecord],
     params: &QrParams,
 ) -> Result<Vec<AnomalyEvent>> {
-    let anomalies = stage_lmdb(reg, records, params)?;
+    commit_batch_with_meta(reg, ledger, records, params, None).map(|(a, _)| a)
+}
+
+/// P5：带 MetaRegistry 的完整提交协议。EXT META 指纹台账在 SQLite 阶段幂等 upsert（best-effort）。
+pub fn commit_batch_with_meta(
+    reg: &DbRegistry,
+    ledger: &Ledger,
+    records: &[IndexedRecord],
+    params: &QrParams,
+    meta: Option<&MetaRegistry>,
+) -> Result<(Vec<AnomalyEvent>, Vec<ExtMetaEvent>)> {
+    let (anomalies, ext_meta) = stage_lmdb_with_meta(reg, records, params, meta)?;
     stage_sqlite(ledger, records)?;
     if let Err(e) = ledger.insert_anomalies(&anomalies) {
         tracing::warn!("审计事件入库失败: {}", e);
     }
-    Ok(anomalies)
+    for ev in &ext_meta {
+        if let Err(e) = ledger.ext_meta_upsert(
+            ev.protocol_hint as i64,
+            &ev.magic_prefix,
+            ev.entropy,
+            ev.has_fixed_header,
+            ev.dst_port as i64,
+            now_secs(),
+        ) {
+            tracing::warn!("EXT META 指纹台账入库失败: {}", e);
+        }
+    }
+    Ok((anomalies, ext_meta))
 }
 
 /// hot 数据平面文件写器：append-only，文件边界按 segment_size 强制轮转。

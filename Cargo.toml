@@ -37,10 +37,16 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 字节工具（大端键值编解码）
 byteorder = "1"
+# P5 PCAP 司法级导出（版本与 sov-probe 锁文件对齐 2.0.0）
+pcap-file = "2"
 
 [features]
 default = []
 parquet-export = []
+
+[dev-dependencies]
+# P5 E2E 压测 MD5 对账（纯 Rust、零运行时依赖）
+md5 = "0.8.1"
 
 [profile.release]
 opt-level = 3

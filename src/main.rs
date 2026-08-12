@@ -62,8 +62,45 @@ enum Command {
         #[arg(long)]
         wal_dir: Option<std::path::PathBuf>,
     },
-    /// 司法级导出 PCAP/Parquet（P5）。
-    Export,
+    /// 司法级导出 PCAP（P5）：DBI_RECORD_TS 游标 + 内存 BPF 过滤 + orig_len/incl_len 裁切还原。
+    Export {
+        /// 起始时间戳（ns，含）。
+        #[arg(long)]
+        start: Option<u64>,
+        /// 截止时间戳（ns，含）。
+        #[arg(long)]
+        end: Option<u64>,
+        /// BPF：协议号（6=TCP 17=UDP）。
+        #[arg(long)]
+        proto: Option<u8>,
+        /// BPF：源 IP（a.b.c.d）。
+        #[arg(long)]
+        src_ip: Option<String>,
+        /// BPF：目的 IP（a.b.c.d）。
+        #[arg(long)]
+        dst_ip: Option<String>,
+        /// BPF：源端口。
+        #[arg(long)]
+        sport: Option<u16>,
+        /// BPF：目的端口。
+        #[arg(long)]
+        dport: Option<u16>,
+        /// BPF：TCP flags（fin,syn,rst,psh,ack,urg；全部置位才通过）。
+        #[arg(long)]
+        flags: Option<String>,
+        /// 输出 pcap 文件路径。
+        #[arg(long, default_value = "export.pcap")]
+        output: std::path::PathBuf,
+    },
+    /// MetaBind / EXT META（P5）：注册协议绑定规则 / 查询指纹台账。
+    Meta {
+        /// 把 config.analysis.meta_binds 注册进管理平面（按 name 幂等 upsert）。
+        #[arg(long)]
+        register: bool,
+        /// 列出 meta_binds 规则与 ext_meta 指纹台账。
+        #[arg(long)]
+        list: bool,
+    },
     /// 报文时间窗查询（DBI_RECORD_TS，P3.5）。
     Query {
         /// 起始时间戳（ns，含）。
@@ -158,6 +195,18 @@ fn main() -> Result<()> {
             end,
             limit,
         } => cmd_anomaly(&cfg, kind, start, end, limit),
+        Command::Export {
+            start,
+            end,
+            proto,
+            src_ip,
+            dst_ip,
+            sport,
+            dport,
+            flags,
+            output,
+        } => cmd_export(&cfg, start, end, proto, src_ip, dst_ip, sport, dport, flags, &output),
+        Command::Meta { register, list } => cmd_meta(&cfg, register, list),
         other => bail!("子命令 {:?} 尚未在本期落地，按 09 白皮书阶段推进", other),
     }
 }
@@ -385,6 +434,123 @@ fn cmd_anomaly(
     let rows = ledger.query_anomalies(kind, start, end, limit)?;
     for e in &rows {
         println!("{}", serde_json::to_string(e)?);
+    }
+    Ok(())
+}
+
+/// P5：司法级 PCAP 导出——DBI_RECORD_TS 时间窗 + 内存 BPF 过滤 → 数据平面回读 → 流式落盘。
+#[allow(clippy::too_many_arguments)] // CLI 子命令参数位，扁平可读优先。
+fn cmd_export(
+    cfg: &Config,
+    start: Option<u64>,
+    end: Option<u64>,
+    proto: Option<u8>,
+    src_ip: Option<String>,
+    dst_ip: Option<String>,
+    sport: Option<u16>,
+    dport: Option<u16>,
+    flags: Option<String>,
+    output: &std::path::Path,
+) -> Result<()> {
+    let reg = DbRegistry::open(&cfg.lmdb_dir(), cfg.lmdb_map_size_bytes()? as usize)?;
+    let ledger = Ledger::open(&cfg.ledger_path())?;
+    let (flags_all, flags_any) = match flags {
+        Some(raw) => {
+            let names: Vec<&str> = raw.split(',').map(str::trim).collect();
+            let bits = sov_vault::export::BpfFilter::parse_flags(&names)
+                .ok_or_else(|| anyhow::anyhow!("非法 flags: {}（fin/syn/rst/psh/ack/urg）", raw))?;
+            (Some(bits), None)
+        }
+        None => (None, None),
+    };
+    let src_ip = match src_ip.as_deref() {
+        Some(s) => Some(
+            sov_vault::util::ip4_from_string(s)
+                .ok_or_else(|| anyhow::anyhow!("非法 src_ip: {}", s))?,
+        ),
+        None => None,
+    };
+    let dst_ip = match dst_ip.as_deref() {
+        Some(s) => Some(
+            sov_vault::util::ip4_from_string(s)
+                .ok_or_else(|| anyhow::anyhow!("非法 dst_ip: {}", s))?,
+        ),
+        None => None,
+    };
+    let filter = sov_vault::export::BpfFilter {
+        proto,
+        src_ip,
+        dst_ip,
+        sport,
+        dport,
+        flags_all,
+        flags_any,
+    };
+    let out = std::fs::File::create(output)?;
+    let stats = sov_vault::export::export_pcap(&reg, &ledger, &filter, start, end, out)?;
+    tracing::info!(
+        "PCAP 导出完成 → {}：packets={} filtered={} unresolved={} incl={}B orig={}B",
+        output.display(),
+        stats.packets,
+        stats.filtered,
+        stats.unresolved,
+        stats.incl_bytes,
+        stats.orig_bytes
+    );
+    if stats.unresolved > 0 {
+        tracing::warn!("{} 条报文数据平面回读失败（截断/损坏），已跳过", stats.unresolved);
+    }
+    Ok(())
+}
+
+/// P5：MetaBind / EXT META 管理——注册配置规则（幂等）+ 查询指纹台账。
+fn cmd_meta(cfg: &Config, register: bool, list: bool) -> Result<()> {
+    let ledger = Ledger::open(&cfg.ledger_path())?;
+    if register {
+        println!("=== 注册 meta_binds（按 name 幂等） ===");
+        for b in &cfg.analysis.meta_binds {
+            let id = ledger.upsert_meta_bind(
+                &b.name,
+                b.proto as i64,
+                b.dst_port as i64,
+                &b.fingerprint,
+                &b.extractor,
+            )?;
+            println!(
+                "  {}: id={} proto={} dport={} fingerprint={} extractor={}",
+                b.name, id, b.proto, b.dst_port, b.fingerprint, b.extractor
+            );
+        }
+        println!("已注册 {} 条", cfg.analysis.meta_binds.len());
+    }
+    if list || !register {
+        println!("=== meta_binds ===");
+        let binds = ledger.list_meta_binds()?;
+        if binds.is_empty() {
+            println!("（空，用 `sovvault meta --register` 从配置注册）");
+        }
+        for r in &binds {
+            println!(
+                "  id={} name={} proto={:?} dport={:?} fingerprint={:?} extractor={:?} enabled={}",
+                r.id, r.name, r.proto, r.dst_port, r.fingerprint, r.extractor, r.enabled
+            );
+        }
+        println!("=== ext_meta 指纹台账 ===");
+        let metas = ledger.list_ext_meta()?;
+        if metas.is_empty() {
+            println!("（空，ingest 带 MetaRegistry 后首载荷自动登记）");
+        }
+        for e in &metas {
+            println!(
+                "  hint={} magic={:02X?} entropy={:.3} fixed={} dport={:?} hits={}",
+                e.protocol_hint,
+                e.magic_prefix.as_deref().unwrap_or(&[]),
+                e.entropy.unwrap_or(-1.0),
+                e.has_fixed_header,
+                e.dst_port,
+                e.hit_count
+            );
+        }
     }
     Ok(())
 }

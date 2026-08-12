@@ -26,6 +26,7 @@ use crate::db::{
 };
 use crate::ledger::AnomalyEvent;
 use crate::anomaly::{ANOM_QR_RST_ABORT, ANOM_QR_UNMATCHED};
+use crate::meta::{ExtMetaEvent, MetaRegistry, ProtocolKind};
 use anyhow::Result;
 use heed::types::Bytes;
 use heed::Database;
@@ -203,10 +204,23 @@ pub struct QrMatcher<'e> {
     /// 批内连接热状态缓存（load-modify-write，同 txn，杜绝内存/LMDB 双态漂移）。
     conns: HashMap<u64, ConnRt>,
     anomalies: Vec<AnomalyEvent>,
+    /// P5：MetaBind 注册表（可选）。命中规则 → 连接绑定 + 提取请求键；None = P3 旧行为（32B 前缀键）。
+    meta: Option<&'e MetaRegistry>,
+    /// P5：连接首次绑定收集的协议指纹（低频），供调用方落 ext_meta 台账。
+    ext_meta: Vec<ExtMetaEvent>,
 }
 
 impl<'e> QrMatcher<'e> {
     pub fn begin<'a>(reg: &'a DbRegistry, params: &QrParams) -> Result<QrMatcher<'a>> {
+        QrMatcher::begin_with_meta(reg, params, None)
+    }
+
+    /// P5：带 MetaRegistry 的匹配引擎（首载荷绑定连接 + 协议键/伪键提取）。
+    pub fn begin_with_meta<'a>(
+        reg: &'a DbRegistry,
+        params: &QrParams,
+        meta: Option<&'a MetaRegistry>,
+    ) -> Result<QrMatcher<'a>> {
         let txn = reg.write_txn()?;
         Ok(QrMatcher {
             dbs: reg.dbs,
@@ -214,6 +228,8 @@ impl<'e> QrMatcher<'e> {
             ack_tol: params.ack_tolerance,
             conns: HashMap::new(),
             anomalies: Vec::new(),
+            meta,
+            ext_meta: Vec::new(),
         })
     }
 
@@ -222,6 +238,11 @@ impl<'e> QrMatcher<'e> {
         self.writeback_conns()?;
         self.txn.commit()?;
         Ok(self.anomalies)
+    }
+
+    /// P5：本批收集的连接级 EXT META 指纹事件（commit 前读取）。
+    pub fn ext_meta_events(&self) -> &[ExtMetaEvent] {
+        &self.ext_meta
     }
 
     /// 处理一条报文：RECORD_TS 确定性索引（P2）+ 连接状态机 + QR 匹配（P3），同一 txn。
@@ -412,6 +433,33 @@ impl<'e> QrMatcher<'e> {
         abs_end: u64,
     ) -> Result<()> {
         let q_first_idx = r.idx();
+        // P5：请求键提取（MetaBind 绑定连接 + 协议键/伪键）。首载荷评估绑定连接；
+        // 已绑定 → 按 protocol_hint 复用提取器；无 MetaRegistry → P3 兼容（32B 前缀键）。
+        let (req_key, pseudo) = if let Some(mr) = self.meta {
+            if st.meta_bind_id < 0 {
+                let b = mr.bind_and_extract(&r.rec.payload, r.rec.proto as u8, r.rec.dst_port);
+                st.meta_bind_id = b.meta_bind_id;
+                st.protocol_hint = b.protocol_hint;
+                if st.protocol_hint != ProtocolKind::Unknown as u8 {
+                    let fp = crate::meta::fingerprint(&r.rec.payload);
+                    self.ext_meta.push(ExtMetaEvent {
+                        conn_hash: h,
+                        protocol_hint: st.protocol_hint,
+                        dst_port: r.rec.dst_port,
+                        magic_prefix: fp.magic_prefix,
+                        entropy: fp.entropy,
+                        has_fixed_header: fp.has_fixed_header,
+                    });
+                }
+                (b.key, if b.pseudo { 1 } else { 0 })
+            } else {
+                let kind = ProtocolKind::from_u8(st.protocol_hint);
+                let k = crate::meta::extract_key(&r.rec.payload, kind);
+                (k.key, if k.pseudo { 1 } else { 0 })
+            }
+        } else {
+            (req_key_of(&r.rec), 0)
+        };
         let pair = QrPairValue {
             status: QrStatus::Pending as u8,
             conn_hash: h,
@@ -422,10 +470,10 @@ impl<'e> QrMatcher<'e> {
             r_len: 0,
             abs_q_seq: abs_start,
             abs_q_end: abs_end,
-            pseudo: 0,
+            pseudo,
             q_idx: vec![q_first_idx],
             r_idx: Vec::new(),
-            req_key: req_key_of(&r.rec),
+            req_key,
             resp_key: Vec::new(),
         };
         let inc = st.incarnation;
@@ -1122,6 +1170,89 @@ mod tests {
         let h = ch();
         assert_eq!(pending_len(&reg, h, 0), 0);
         assert_eq!(pair_at(&reg, q_idx).unwrap().status, QrStatus::Matched as u8);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P5：MetaRegistry 绑定连接 + HTTP 请求行提取 + 二进制伪键。
+    #[test]
+    fn meta_bind_binds_conn_and_extracts_keys() {
+        use crate::config::MetaBind;
+        use crate::meta::MetaRegistry;
+        let dir = tmpdir("metabind");
+        let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
+        let params = QrParams::default();
+        let binds = vec![MetaBind {
+            name: "web".into(),
+            proto: 6,
+            dst_port: 80,
+            fingerprint: "http".into(),
+            extractor: "http_line".into(),
+        }];
+        let mr = MetaRegistry::from_binds(&binds);
+        let mut o = Offset(0);
+
+        // HTTP 连接：握手 + 请求 → 绑定 web 规则（meta_bind_id=1），req_key=请求行，pseudo=0。
+        let q = pkt(CIP, SIP, CPORT, 80, TCP_ACK, 1001, 5001, b"GET /a/b HTTP/1.1\r\n");
+        let q_idx = (1u64 << 32) | o.next(&q) as u64;
+        let mut m = QrMatcher::begin_with_meta(&reg, &params, Some(&mr)).unwrap();
+        for (rec, off) in [
+            (pkt(CIP, SIP, CPORT, 80, TCP_SYN, 1000, 0, b""), o.next(&c2s(1000, 0, b""))),
+            (pkt(SIP, CIP, 80, CPORT, TCP_SYN | TCP_ACK, 5000, 1001, b""), o.next(&s2c(5000, 1001, b""))),
+            (q.clone(), q_idx as u32),
+        ] {
+            m.ingest(&IndexedRecord { dev_id: 1, file_id: 1, offset: off, rec }).unwrap();
+        }
+        let events = m.ext_meta_events().to_vec();
+        m.commit().unwrap();
+        let h = conn_hash(1, u32::from_be_bytes(CIP), CPORT, u32::from_be_bytes(SIP), 80, 6);
+        let cs = conn_state_at(&reg, h);
+        assert_eq!(cs.meta_bind_id, 1, "连接应绑定 web 规则");
+        assert_eq!(cs.protocol_hint, 1, "protocol_hint=http");
+        let p = pair_at(&reg, q_idx).unwrap();
+        assert_eq!(p.pseudo, 0);
+        assert_eq!(p.req_key, b"GET /a/b HTTP/1.1");
+        // EXT META 指纹：HTTP 低熵 + magic "GET "。
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].protocol_hint, 1);
+        assert_eq!(events[0].magic_prefix, b"GET ");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// P5：无规则端口 → 二进制伪键稳定（同签名同 KEY），pseudo=1。
+    #[test]
+    fn meta_bind_binary_pseudo_key_stable() {
+        use crate::meta::MetaRegistry;
+        let dir = tmpdir("pseudo");
+        let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
+        let params = QrParams::default();
+        let mr = MetaRegistry::from_binds(&[]);
+        let mut o = Offset(0);
+        let mk_q = |seq: u32, ack: u32, off: &mut Offset| {
+            let payload: Vec<u8> = (0..32u32).map(|i| (i.wrapping_mul(0x9E3779B9) >> 16) as u8).collect();
+            let q = pkt(CIP, SIP, CPORT, 9999, TCP_ACK, seq, ack, &payload);
+            let idx = (1u64 << 32) | off.next(&q) as u64;
+            (q, idx)
+        };
+        // 两条同签名请求（不同 seq）→ 同伪键。
+        let (q1, i1) = mk_q(1001, 5001, &mut o);
+        let (q2, i2) = mk_q(1011, 5001, &mut o);
+        let mut m = QrMatcher::begin_with_meta(&reg, &params, Some(&mr)).unwrap();
+        for (rec, off) in [
+            (pkt(CIP, SIP, CPORT, 9999, TCP_SYN, 1000, 0, b""), o.next(&c2s(1000, 0, b""))),
+            (pkt(SIP, CIP, 9999, CPORT, TCP_SYN | TCP_ACK, 5000, 1001, b""), o.next(&s2c(5000, 1001, b""))),
+            (q1, i1 as u32),
+            (q2, i2 as u32),
+        ] {
+            m.ingest(&IndexedRecord { dev_id: 1, file_id: 1, offset: off, rec }).unwrap();
+        }
+        m.commit().unwrap();
+        let p1 = pair_at(&reg, i1).unwrap();
+        let p2 = pair_at(&reg, i2).unwrap();
+        assert_eq!(p1.pseudo, 1);
+        assert_eq!(p2.pseudo, 1);
+        assert_eq!(p1.req_key, p2.req_key, "同签名二进制载荷必须同伪键");
+        let h = conn_hash(1, u32::from_be_bytes(CIP), CPORT, u32::from_be_bytes(SIP), 9999, 6);
+        assert_eq!(conn_state_at(&reg, h).meta_bind_id, -1, "无规则 → 仅自动检测");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -2,7 +2,7 @@
 //! DDL 对齐 09_sovVault_实施方案.md §4.4。
 
 use anyhow::Result;
-use rusqlite::{params, params_from_iter, Connection};
+use rusqlite::{params, params_from_iter, Connection, OptionalExtension};
 use std::path::Path;
 
 /// files.kind：0=WAL 1=PCAP。
@@ -41,6 +41,31 @@ pub struct AnomalyEvent {
     pub conn_hash: Option<Vec<u8>>,
     pub qr_id: Option<i64>,
     pub detail: Option<String>,
+}
+
+/// meta_binds 表行（Meta 子命令 / 查询展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct MetaBindRow {
+    pub id: i64,
+    pub name: String,
+    pub proto: Option<i64>,
+    pub dst_port: Option<i64>,
+    pub fingerprint: Option<String>,
+    pub extractor: Option<String>,
+    pub enabled: i64,
+}
+
+/// ext_meta 表行（Meta 子命令 / 查询展示）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ExtMetaRow {
+    pub meta_bind_id: i64,
+    pub protocol_hint: i64,
+    pub magic_prefix: Option<Vec<u8>>,
+    pub entropy: Option<f64>,
+    pub has_fixed_header: bool,
+    pub dst_port: Option<i64>,
+    pub hit_count: i64,
+    pub created_at: i64,
 }
 
 pub struct Ledger {
@@ -115,6 +140,19 @@ impl Ledger {
             |r| r.get(0),
         )?;
         Ok(v as u64)
+    }
+
+    /// 数据平面文件路径（PCAP 导出回读 / 司法溯源用）。
+    pub fn file_path(&self, file_id: i64) -> Result<Option<String>> {
+        let v: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT path FROM files WHERE file_id = ?1",
+                params![file_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        Ok(v)
     }
 
     /// 推进水位线（单调：只允许前进）。
@@ -349,6 +387,132 @@ impl Ledger {
         Ok(self.conn.last_insert_rowid())
     }
 
+    /// P5：meta_binds 幂等 upsert（按 name 查改插），返回主键 id。重启重跑不产生重复行。
+    pub fn upsert_meta_bind(
+        &self,
+        name: &str,
+        proto: i64,
+        dst_port: i64,
+        fingerprint: &str,
+        extractor: &str,
+    ) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT id FROM meta_binds WHERE name = ?1",
+                params![name],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(id) = existing {
+            self.conn.execute(
+                "UPDATE meta_binds SET proto=?2, dst_port=?3, fingerprint=?4, extractor=?5, enabled=1
+                 WHERE id=?1",
+                params![id, proto, dst_port, fingerprint, extractor],
+            )?;
+            return Ok(id);
+        }
+        self.conn.execute(
+            "INSERT INTO meta_binds(name, proto, dst_port, fingerprint, extractor, enabled)
+             VALUES(?1,?2,?3,?4,?5,1)",
+            params![name, proto, dst_port, fingerprint, extractor],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// meta_binds 列表（Meta 子命令展示）。
+    pub fn list_meta_binds(&self) -> Result<Vec<MetaBindRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, name, proto, dst_port, fingerprint, extractor, enabled FROM meta_binds
+             ORDER BY id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(MetaBindRow {
+                id: r.get(0)?,
+                name: r.get(1)?,
+                proto: r.get(2)?,
+                dst_port: r.get(3)?,
+                fingerprint: r.get(4)?,
+                extractor: r.get(5)?,
+                enabled: r.get(6)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// P5：ext_meta 幂等 upsert——同 (protocol_hint, magic_prefix, dst_port) 签名命中则 hit_count+1，
+    /// 否则新登记（连接首载荷指纹台账，低频）。返回当前 hit_count。
+    pub fn ext_meta_upsert(
+        &self,
+        protocol_hint: i64,
+        magic_prefix: &[u8],
+        entropy: f64,
+        has_fixed_header: bool,
+        dst_port: i64,
+        created_at: i64,
+    ) -> Result<i64> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT hit_count FROM ext_meta
+                 WHERE protocol_hint=?1 AND magic_prefix=?2 AND dst_port=?3",
+                params![protocol_hint, magic_prefix, dst_port],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(hits) = existing {
+            let new_hits = hits + 1;
+            self.conn.execute(
+                "UPDATE ext_meta SET hit_count=?2, entropy=?3, has_fixed_header=?4
+                 WHERE protocol_hint=?1 AND magic_prefix=?5 AND dst_port=?6",
+                params![
+                    protocol_hint,
+                    new_hits,
+                    entropy,
+                    has_fixed_header as i64,
+                    magic_prefix,
+                    dst_port
+                ],
+            )?;
+            return Ok(new_hits);
+        }
+        self.conn.execute(
+            "INSERT INTO ext_meta(protocol_hint, magic_prefix, entropy, has_fixed_header, dst_port, hit_count, created_at)
+             VALUES(?1,?2,?3,?4,?5,1,?6)",
+            params![protocol_hint, magic_prefix, entropy, has_fixed_header as i64, dst_port, created_at],
+        )?;
+        Ok(1)
+    }
+
+    /// ext_meta 列表（Meta 子命令展示）。
+    pub fn list_ext_meta(&self) -> Result<Vec<ExtMetaRow>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT meta_bind_id, protocol_hint, magic_prefix, entropy, has_fixed_header,
+                    dst_port, hit_count, created_at FROM ext_meta ORDER BY hit_count DESC",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(ExtMetaRow {
+                meta_bind_id: r.get(0)?,
+                protocol_hint: r.get(1)?,
+                magic_prefix: r.get::<_, Option<Vec<u8>>>(2)?,
+                entropy: r.get(3)?,
+                has_fixed_header: r.get(4)?,
+                dst_port: r.get(5)?,
+                hit_count: r.get(6)?,
+                created_at: r.get(7)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn meta_bind_count(&self) -> Result<i64> {
         let n: i64 = self
             .conn
@@ -439,6 +603,46 @@ mod tests {
             .register_ext_meta(1, Some(b"GET "), Some(3.5), true, Some(80), 9)
             .unwrap();
         assert!(e > 0);
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn file_path_and_p5_meta_upserts() {
+        let p = tmpdb("p5meta");
+        let l = Ledger::open(&p).unwrap();
+        // file_path：登记后可回读。
+        let id = l
+            .insert_file("/data/hot/seg1.wal", FileKind::Wal, 1, Some(0), 1)
+            .unwrap();
+        assert_eq!(l.file_path(id).unwrap(), Some("/data/hot/seg1.wal".into()));
+        assert_eq!(l.file_path(9999).unwrap(), None);
+
+        // meta_binds upsert 幂等（按 name）。
+        let m1 = l
+            .upsert_meta_bind("web", 6, 80, "http", "http_line")
+            .unwrap();
+        let m2 = l
+            .upsert_meta_bind("web", 6, 80, "http", "http_line")
+            .unwrap();
+        assert_eq!(m1, m2, "同名规则幂等返回同一 id");
+        let binds = l.list_meta_binds().unwrap();
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].name, "web");
+        // 更新后仍同 id。
+        let m3 = l
+            .upsert_meta_bind("web", 6, 8080, "http", "http_line")
+            .unwrap();
+        assert_eq!(m1, m3);
+
+        // ext_meta 幂等 upsert：同签名 hit_count 递增，不重复插行。
+        let h1 = l.ext_meta_upsert(1, b"GET ", 3.2, false, 80, 9).unwrap();
+        assert_eq!(h1, 1);
+        let h2 = l.ext_meta_upsert(1, b"GET ", 3.2, false, 80, 9).unwrap();
+        assert_eq!(h2, 2);
+        let rows = l.list_ext_meta().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].hit_count, 2);
+        assert_eq!(rows[0].magic_prefix.as_deref(), Some(&b"GET "[..]));
         let _ = std::fs::remove_file(&p);
     }
 }

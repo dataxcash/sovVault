@@ -8,6 +8,8 @@ pub mod db;
 pub mod decrypt;
 pub mod id;
 pub mod ingest;
+pub mod export;
+pub mod meta;
 pub mod ledger;
 pub mod qr;
 pub mod query;
