@@ -13,10 +13,10 @@
 //!   2) 从旧水位线重新消费同一批记录；
 //!   3) 确定性主键 + MDB_NOOVERWRITE → 重放幂等收敛，零脏数据。
 
-use crate::db::v_record_summary_encode;
-use crate::db::{put_no_overwrite, DbRegistry, RecordSummary, IDX_RECORD_TS};
+use crate::db::{DbRegistry, RecordSummary};
 use crate::id;
-use crate::ledger::{FileKind, FileState, Ledger};
+use crate::ledger::{AnomalyEvent, FileKind, FileState, Ledger};
+use crate::qr::{QrMatcher, QrParams};
 use anyhow::{Context, Result};
 use sov_probe::wal::header::WalRecord;
 use std::collections::HashMap;
@@ -24,9 +24,10 @@ use std::fs::{File, OpenOptions};
 use std::io::{Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
-/// 待提交的索引记录：携带数据平面锚点 (file_id, offset)。
+/// 待提交的索引记录：携带数据平面锚点 (dev_id, file_id, offset)。
 #[derive(Debug, Clone)]
 pub struct IndexedRecord {
+    pub dev_id: u32,
     pub file_id: u32,
     pub offset: u32,
     pub rec: WalRecord,
@@ -58,17 +59,19 @@ impl From<&WalRecord> for RecordSummary {
     }
 }
 
-/// ① LMDB 阶段：开启 RW_TXN，写入本批全部索引数据，提交。
-/// 逐条 NO_OVERWRITE——重放时已存在键直接跳过（幂等收敛核心）。
-pub fn stage_lmdb(reg: &DbRegistry, records: &[IndexedRecord]) -> Result<()> {
-    let mut txn = reg.write_txn()?;
+/// ① LMDB 阶段：开启 RW_TXN，逐条处理（RECORD_TS 确定性索引 + P3 QR 匹配引擎），提交。
+/// 一个 Batch = 一个 LMDB 事务（P2 2PC-Lite 第一步）；Q 打开走 NO_OVERWRITE（重放幂等）。
+/// 返回审计事件（代际重代/RST 级联，低频），由调用方在 SQLite 阶段落库。
+pub fn stage_lmdb(
+    reg: &DbRegistry,
+    records: &[IndexedRecord],
+    params: &QrParams,
+) -> Result<Vec<AnomalyEvent>> {
+    let mut m = QrMatcher::begin(reg, params)?;
     for r in records {
-        let key = crate::db::k_record_ts(r.rec.timestamp_ns, r.idx());
-        let val = v_record_summary_encode(&RecordSummary::from(&r.rec));
-        put_no_overwrite(&reg.dbs[IDX_RECORD_TS], &mut txn, &key, &val)?;
+        m.ingest(r)?;
     }
-    txn.commit()?;
-    Ok(())
+    m.commit()
 }
 
 /// ② SQLite 阶段：按文件聚合推进水位线（每文件取本批最大已提交字节边界）。
@@ -88,10 +91,21 @@ pub fn stage_sqlite(ledger: &Ledger, records: &[IndexedRecord]) -> Result<()> {
 }
 
 /// 完整提交协议：① LMDB 先行 → ② SQLite 殿后 →（③ 游标推进由调用方执行）。
-pub fn commit_batch(reg: &DbRegistry, ledger: &Ledger, records: &[IndexedRecord]) -> Result<()> {
-    stage_lmdb(reg, records)?;
+/// 审计事件（低频）best-effort 落库，不阻塞提交协议。
+pub fn commit_batch(
+    reg: &DbRegistry,
+    ledger: &Ledger,
+    records: &[IndexedRecord],
+    params: &QrParams,
+) -> Result<Vec<AnomalyEvent>> {
+    let anomalies = stage_lmdb(reg, records, params)?;
     stage_sqlite(ledger, records)?;
-    Ok(())
+    for a in &anomalies {
+        if let Err(e) = ledger.insert_anomaly(a) {
+            tracing::warn!("审计事件入库失败: {}", e);
+        }
+    }
+    Ok(anomalies)
 }
 
 /// hot 数据平面文件写器：append-only，文件边界按 segment_size 强制轮转。
@@ -255,9 +269,11 @@ pub struct BatchPipeline<'a> {
     hot: HotFileWriter<'a>,
     pending: Vec<IndexedRecord>,
     batch_size: u32,
+    analysis: QrParams,
 }
 
 impl<'a> BatchPipeline<'a> {
+    #[allow(clippy::too_many_arguments)] // 构造参数均为配置位，扁平可读优先。
     pub fn new(
         reg: &'a DbRegistry,
         ledger: &'a Ledger,
@@ -266,6 +282,7 @@ impl<'a> BatchPipeline<'a> {
         segment_seq: u32,
         segment_size: u64,
         batch_size: u32,
+        analysis: QrParams,
     ) -> Result<BatchPipeline<'a>> {
         let hot = HotFileWriter::open(hot_dir, ledger, dev_id, segment_seq, segment_size)?;
         Ok(BatchPipeline {
@@ -274,6 +291,7 @@ impl<'a> BatchPipeline<'a> {
             hot,
             pending: Vec::with_capacity(batch_size as usize),
             batch_size,
+            analysis,
         })
     }
 
@@ -286,6 +304,7 @@ impl<'a> BatchPipeline<'a> {
         }
         let (file_id, offset) = self.hot.append(&rec)?;
         self.pending.push(IndexedRecord {
+            dev_id: self.hot.dev_id as u32,
             file_id,
             offset,
             rec,
@@ -302,7 +321,7 @@ impl<'a> BatchPipeline<'a> {
             return Ok(());
         }
         let records = std::mem::take(&mut self.pending);
-        commit_batch(self.reg, self.ledger, &records)?;
+        commit_batch(self.reg, self.ledger, &records, &self.analysis)?;
         Ok(())
     }
 
@@ -336,6 +355,7 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::IDX_RECORD_TS;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -390,8 +410,17 @@ mod tests {
         let dir = tmpdir("pipe");
         let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
         let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
-        let mut pipe =
-            BatchPipeline::new(&reg, &ledger, dir.join("hot"), 1, 0, 64 * 1024, 3).unwrap();
+        let mut pipe = BatchPipeline::new(
+            &reg,
+            &ledger,
+            dir.join("hot"),
+            1,
+            0,
+            64 * 1024,
+            3,
+            QrParams::default(),
+        )
+        .unwrap();
         let fid = pipe.hot_file_id(); // 数据实际落在文件 1
         for i in 0..7u64 {
             pipe.push_record(rec(i, &[i as u8; 10])).unwrap();

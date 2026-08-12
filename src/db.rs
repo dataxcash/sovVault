@@ -128,12 +128,31 @@ pub fn k_qr_pair(q_first_idx: u64) -> [u8; 8] {
     q_first_idx.to_be_bytes()
 }
 
-/// QR_PENDING: [conn_hash:u64][abs_q_end:u48]
-pub fn k_qr_pending(conn_hash: u64, abs_q_end: u64) -> Vec<u8> {
-    let mut v = Vec::with_capacity(14);
-    put_u64(&mut v, conn_hash);
-    put_u48(&mut v, abs_q_end);
-    v
+/// QR_PENDING: [conn_hash:u64][incarnation:u16][abs_q_end:u48]（v0.5 代际物理前缀，16B）。
+/// 旧代际挂起 Q 在 B+ 树存储层被物理隔离——幽灵包（旧连接迟到 ACK/RST）游标读不到。
+pub fn k_qr_pending(conn_hash: u64, incarnation: u16, abs_q_end: u64) -> [u8; 16] {
+    let mut k = [0u8; 16];
+    k[0..8].copy_from_slice(&conn_hash.to_be_bytes());
+    k[8..10].copy_from_slice(&incarnation.to_be_bytes());
+    k[10..16].copy_from_slice(&put_u48_bytes(abs_q_end));
+    k
+}
+
+/// QR_PENDING 前缀：[conn_hash:u64][incarnation:u16]（10B），范围扫描起点。
+pub fn k_qr_pending_prefix(conn_hash: u64, incarnation: u16) -> [u8; 10] {
+    let mut k = [0u8; 10];
+    k[0..8].copy_from_slice(&conn_hash.to_be_bytes());
+    k[8..10].copy_from_slice(&incarnation.to_be_bytes());
+    k
+}
+
+/// u48 大端编码（供键构造，避免中途分配）。
+fn put_u48_bytes(x: u64) -> [u8; 6] {
+    debug_assert!(x <= 0x0000_FFFF_FFFF_FFFF, "u48 溢出: {}", x);
+    let b = x.to_be_bytes();
+    let mut out = [0u8; 6];
+    out.copy_from_slice(&b[2..8]);
+    out
 }
 
 /// CONN_QR / QR_KEY 复合键：[prefix:u64][q_ts:u64][q_first_idx:u64]
@@ -460,11 +479,16 @@ mod tests {
 
     #[test]
     fn key_builders_roundtrip() {
-        // QR_PENDING 键：解码回字段。
-        let k = k_qr_pending(0x1122_3344_5566_7788, 0x1234_5678_9ABC);
-        assert_eq!(k.len(), 14);
+        // QR_PENDING 键（v0.5 含代际）：解码回字段。
+        let k = k_qr_pending(0x1122_3344_5566_7788, 0xAB, 0x1234_5678_9ABC);
+        assert_eq!(k.len(), 16);
         assert_eq!(&k[0..8], &0x1122_3344_5566_7788u64.to_be_bytes());
-        assert_eq!(&k[8..14], &0x1234_5678_9ABCu64.to_be_bytes()[2..8]);
+        assert_eq!(&k[8..10], &0x00ABu16.to_be_bytes());
+        assert_eq!(&k[10..16], &0x1234_5678_9ABCu64.to_be_bytes()[2..8]);
+        // 前缀：前 10B 与全键一致。
+        let p = k_qr_pending_prefix(0x1122_3344_5566_7788, 0xAB);
+        assert_eq!(p.len(), 10);
+        assert_eq!(&k[..10], &p[..]);
 
         let k = k_conn_qr(1, 2, 3);
         assert_eq!(k.len(), 24);
@@ -582,7 +606,7 @@ mod tests {
         let mut txn = reg.write_txn().unwrap();
         let conn = k_conn_state(123);
         reg.dbs[0].put(&mut txn, &conn, &[0xAB; 169]).unwrap();
-        let pending = k_qr_pending(123, 456);
+        let pending = k_qr_pending(123, 0, 456);
         reg.dbs[2]
             .put(&mut txn, &pending, &v_qr_pending_encode(9, 10, 11))
             .unwrap();

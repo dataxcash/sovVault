@@ -8,6 +8,7 @@ pub mod decrypt;
 pub mod id;
 pub mod ingest;
 pub mod ledger;
+pub mod qr;
 pub mod reassembly;
 pub mod util;
 pub mod walscan;

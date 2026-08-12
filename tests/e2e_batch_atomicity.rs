@@ -7,6 +7,7 @@ use sov_probe::wal::header::WalRecord;
 use sov_vault::batch::{commit_batch, stage_lmdb, BatchPipeline, HotFileWriter, IndexedRecord};
 use sov_vault::db::DbRegistry;
 use sov_vault::ledger::Ledger;
+use sov_vault::qr::QrParams;
 use std::path::PathBuf;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -40,10 +41,15 @@ fn rec(ts: u64, payload: &[u8]) -> WalRecord {
 
 fn indexed(file_id: u32, offset: u32, rec: WalRecord) -> IndexedRecord {
     IndexedRecord {
+        dev_id: 1,
         file_id,
         offset,
         rec,
     }
+}
+
+fn qr_params() -> QrParams {
+    QrParams::default()
 }
 
 fn rec_ts_count(reg: &DbRegistry) -> u64 {
@@ -60,7 +66,7 @@ fn injected_commit_failure_keeps_watermark() {
 
     // 批次引用未注册的 file_id=1：stage_lmdb（先行）成功，stage_sqlite 失败 → 协议报错。
     let r1 = indexed(1, 0, rec(1, b"GET /a"));
-    assert!(commit_batch(&reg, &ledger, std::slice::from_ref(&r1)).is_err());
+    assert!(commit_batch(&reg, &ledger, std::slice::from_ref(&r1), &qr_params()).is_err());
     // LMDB 已先行提交（1 条），水位线无从推进。
     assert_eq!(rec_ts_count(&reg), 1);
 
@@ -72,7 +78,7 @@ fn injected_commit_failure_keeps_watermark() {
         Some(0),
         1,
     );
-    commit_batch(&reg, &ledger, &[r1]).unwrap();
+    commit_batch(&reg, &ledger, &[r1], &qr_params()).unwrap();
     assert_eq!(rec_ts_count(&reg), 1); // 不翻倍
     assert_eq!(ledger.watermark(1).unwrap(), 64 + 6); // "GET /a"=6B → 70
     let _ = std::fs::remove_dir_all(&dir);
@@ -95,13 +101,14 @@ fn crash_window_replay_converges() {
         for r in &recs {
             let (file_id, offset) = w.append(r).unwrap();
             indexed.push(IndexedRecord {
+                dev_id: 1,
                 file_id,
                 offset,
                 rec: r.clone(),
             });
         }
         // ① LMDB 先行（提交成功）。
-        stage_lmdb(&reg, &indexed).unwrap();
+        stage_lmdb(&reg, &indexed, &qr_params()).unwrap();
         // 模拟崩溃：SQLite 水位线未推进，进程即退。
         assert_eq!(ledger.watermark(1).unwrap(), 0);
         assert_eq!(rec_ts_count(&reg), 5);
@@ -126,12 +133,13 @@ fn crash_window_replay_converges() {
         for r in &recs {
             let (file_id, offset) = w.append(r).unwrap();
             indexed.push(IndexedRecord {
+                dev_id: 1,
                 file_id,
                 offset,
                 rec: r.clone(),
             });
         }
-        commit_batch(&reg, &ledger, &indexed).unwrap();
+        commit_batch(&reg, &ledger, &indexed, &qr_params()).unwrap();
         drop(w);
 
         // ③ 收敛断言：RECORD_TS 仍为 5 条（NO_OVERWRITE 幂等，不翻倍）、水位线 = 文件尾。
@@ -154,7 +162,8 @@ fn file_boundary_forces_commit() {
     let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
     let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
     // segment_size=80：每条 74B，文件 1 放 1 条，文件 2 放 1 条，文件 3 放 1 条。
-    let mut pipe = BatchPipeline::new(&reg, &ledger, dir.join("hot"), 1, 0, 80, 100).unwrap();
+    let mut pipe =
+        BatchPipeline::new(&reg, &ledger, dir.join("hot"), 1, 0, 80, 100, qr_params()).unwrap();
     let fid1 = pipe.hot_file_id();
     pipe.push_record(rec(1, &[1u8; 10])).unwrap(); // 文件1
     pipe.push_record(rec(2, &[2u8; 10])).unwrap(); // 跨界 → 强制提交文件1 + 轮转

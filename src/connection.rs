@@ -88,9 +88,10 @@ pub mod anomaly {
     pub const CONN_OOO_FLOOD: u32 = 1 << 11;
 }
 
-/// ConnState 定长 Value（09 §4.3 布局，字段自大至小防 padding 浪费）。
-/// 序列化总长：8 + 14 + 16 + 32 + 48 + 32 + 21 = 171 字节
+/// ConnState 定长 Value（09 §4.3 布局 + v0.5 代际扩展，字段自大至小防 padding 浪费）。
+/// 序列化总长：8 + 14 + 128 + 8 + 1 + 4 + 8 + 20 = 191 字节
 /// （ip/port 块 14B = client_ip:4+client_port:2+server_ip:4+server_port:2+proto:1+reserved:1）。
+/// v0.5 尾部扩展 20B：last_raw_c:u32 | last_raw_s:u32 | incarnation:u16 | dir_flags:u8 | reserved2:u8 | syn_pkt_idx:u64。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 #[repr(C)]
 pub struct ConnState {
@@ -122,10 +123,49 @@ pub struct ConnState {
     pub protocol_hint: u8,
     pub anomaly_flags: u32,
     pub qr_open: u64,
+    /// c→s 流最后处理的 raw seq（SeqStream.last_raw 持久化，跨批 wrap 正确）。
+    pub last_raw_c: u32,
+    /// s→c 流最后处理的 raw seq。
+    pub last_raw_s: u32,
+    /// 代际号（五元组复用/异窗 SYN/裸跳变时 wrapping_add(1)，0~65535 循环）。
+    pub incarnation: u16,
+    /// 位标志：bit0 = c→s 流已激活基线，bit1 = s→c 流已激活基线。
+    pub dir_flags: u8,
+    pub reserved2: [u8; 1],
+    /// 建立当前代际的 SYN 报文 IDX（代际标识；0 = 无 SYN 建立，如裸跳变/半开）。
+    /// 崩溃重放判定依据：重放的 SYN 是同一报文（同 IDX）→ 绝不重触发重代，
+    /// 从而允许重代判定覆盖 d 的正负两向（ISN ≥ 2^31 不再漏判）。
+    pub syn_pkt_idx: u64,
 }
 
 /// ConnState 定长序列化长度。
-pub const CONN_STATE_SIZE: usize = 171;
+pub const CONN_STATE_SIZE: usize = 191;
+
+impl ConnState {
+    pub fn active_c(&self) -> bool {
+        self.dir_flags & 1 != 0
+    }
+
+    pub fn active_s(&self) -> bool {
+        self.dir_flags & 2 != 0
+    }
+
+    pub fn set_active_c(&mut self, a: bool) {
+        if a {
+            self.dir_flags |= 1;
+        } else {
+            self.dir_flags &= !1;
+        }
+    }
+
+    pub fn set_active_s(&mut self, a: bool) {
+        if a {
+            self.dir_flags |= 2;
+        } else {
+            self.dir_flags &= !2;
+        }
+    }
+}
 
 impl ConnState {
     /// 全 BE 定长序列化。
@@ -172,6 +212,19 @@ impl ConnState {
         b[o..o + 4].copy_from_slice(&self.anomaly_flags.to_be_bytes());
         o += 4;
         b[o..o + 8].copy_from_slice(&self.qr_open.to_be_bytes());
+        o += 8;
+        // v0.5 尾部：last_raw_c | last_raw_s | incarnation | dir_flags | reserved2
+        b[o..o + 4].copy_from_slice(&self.last_raw_c.to_be_bytes());
+        o += 4;
+        b[o..o + 4].copy_from_slice(&self.last_raw_s.to_be_bytes());
+        o += 4;
+        b[o..o + 2].copy_from_slice(&self.incarnation.to_be_bytes());
+        o += 2;
+        b[o] = self.dir_flags;
+        o += 1;
+        b[o] = 0;
+        o += 1;
+        b[o..o + 8].copy_from_slice(&self.syn_pkt_idx.to_be_bytes());
         o += 8;
         debug_assert_eq!(o, CONN_STATE_SIZE);
         b
@@ -224,6 +277,16 @@ impl ConnState {
         o += 4;
         let qr_open = u64::from_be_bytes(b[o..o + 8].try_into().ok()?);
         o += 8;
+        let last_raw_c = u32::from_be_bytes(b[o..o + 4].try_into().ok()?);
+        o += 4;
+        let last_raw_s = u32::from_be_bytes(b[o..o + 4].try_into().ok()?);
+        o += 4;
+        let incarnation = u16::from_be_bytes(b[o..o + 2].try_into().ok()?);
+        o += 2;
+        let dir_flags = b[o];
+        o += 2;
+        let syn_pkt_idx = u64::from_be_bytes(b[o..o + 8].try_into().ok()?);
+        o += 8;
         debug_assert_eq!(o, CONN_STATE_SIZE);
         Some(ConnState {
             state,
@@ -254,6 +317,12 @@ impl ConnState {
             protocol_hint,
             anomaly_flags,
             qr_open,
+            last_raw_c,
+            last_raw_s,
+            incarnation,
+            dir_flags,
+            reserved2: [0u8; 1],
+            syn_pkt_idx,
         })
     }
 }
@@ -295,7 +364,7 @@ mod tests {
 
     #[test]
     fn conn_state_roundtrip() {
-        let cs = ConnState {
+        let mut cs = ConnState {
             state: ConnStateKind::Established as u8,
             client_ip: 0xC0A8_0001,
             server_port: 443,
@@ -303,12 +372,24 @@ mod tests {
             anomaly_flags: anomaly::SEQ_GAP | anomaly::CONN_OOO_FLOOD,
             qr_open: 7,
             meta_bind_id: -1,
+            last_raw_c: 0xDEAD_BEEF,
+            last_raw_s: 0x1234_5678,
+            incarnation: 65535,
+            dir_flags: 0,
+            syn_pkt_idx: 0x1122_3344_5566_7788,
             ..Default::default()
         };
+        cs.set_active_c(true);
+        cs.set_active_s(true);
+        assert!(cs.active_c() && cs.active_s());
         let b = cs.to_bytes();
         assert_eq!(b.len(), CONN_STATE_SIZE);
         let back = ConnState::from_bytes(&b).unwrap();
         assert_eq!(back, cs);
+        // 位清零
+        let mut c2 = cs;
+        c2.set_active_c(false);
+        assert!(!c2.active_c() && c2.active_s());
     }
 
     #[test]
