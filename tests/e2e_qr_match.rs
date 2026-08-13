@@ -93,7 +93,7 @@ fn run(reg: &DbRegistry, recs: &[(WalRecord, u32)]) -> Vec<sov_vault::ledger::An
         })
         .unwrap();
     }
-    m.commit().unwrap()
+    m.commit().unwrap().anomalies
 }
 
 fn ch() -> u64 {

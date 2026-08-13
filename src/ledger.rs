@@ -51,6 +51,20 @@ pub enum EpochState {
     Active = 1,
 }
 
+/// conns 表行：连接维度档案（v0.4.1 L4 ★）。
+///
+/// 历史 conn 检索（DIAG/ROOT CAUSE）需跨 epoch 枚举 CONN_QR。连接到终态时聚合写一次
+/// （first_ts/last_ts，五元组复用则收敛到并集时间窗），查询先查档案定位 epoch 子集再扫，
+/// 避免全 epoch 枚举。
+#[derive(Debug, Clone)]
+pub struct ConnArchive {
+    pub conn_hash: i64,
+    pub first_ts: Option<i64>,
+    pub last_ts: Option<i64>,
+    pub state: i64,
+    pub updated_at: i64,
+}
+
 /// epochs 表行：epoch 时间边界索引（v0.4.1 L1 ★）。
 ///
 /// 历史 epoch 数据冻结，唯一查询裁剪依据是时间。轮转冻结时写一行，
@@ -139,7 +153,12 @@ impl Ledger {
                min_ts INTEGER, max_ts INTEGER,
                record_count INTEGER NOT NULL DEFAULT 0,
                state INTEGER NOT NULL DEFAULT 0);
-             CREATE INDEX IF NOT EXISTS idx_epochs_state ON epochs(state);",
+             CREATE INDEX IF NOT EXISTS idx_epochs_state ON epochs(state);
+             CREATE TABLE IF NOT EXISTS conns(
+               conn_hash INTEGER PRIMARY KEY,
+               first_ts INTEGER, last_ts INTEGER,
+               state INTEGER NOT NULL DEFAULT 0,
+               updated_at INTEGER NOT NULL DEFAULT 0);",
         )?;
         Ok(())
     }
@@ -615,6 +634,44 @@ impl Ledger {
         Ok(out)
     }
 
+    /// L4：连接档案 upsert——五元组复用收敛到并集时间窗（first_ts 取 MIN、last_ts 取 MAX）。
+    /// 连接到终态时写一次；幂等重放收敛，无脏数据。
+    pub fn upsert_conn_archive(&self, a: &ConnArchive) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO conns(conn_hash, first_ts, last_ts, state, updated_at)
+             VALUES(?1,?2,?3,?4,?5)
+             ON CONFLICT(conn_hash) DO UPDATE SET
+               first_ts  = MIN(COALESCE(first_ts, excluded.first_ts), COALESCE(excluded.first_ts, first_ts)),
+               last_ts   = MAX(COALESCE(last_ts, excluded.last_ts), COALESCE(excluded.last_ts, last_ts)),
+               state     = excluded.state,
+               updated_at = excluded.updated_at",
+            params![a.conn_hash, a.first_ts, a.last_ts, a.state, a.updated_at],
+        )?;
+        Ok(())
+    }
+
+    /// L4：连接档案点查（DIAG 定位 epoch 子集；无档案返回 None）。
+    pub fn conn_archive(&self, conn_hash: u64) -> Result<Option<ConnArchive>> {
+        let v: Option<ConnArchive> = self
+            .conn
+            .query_row(
+                "SELECT conn_hash, first_ts, last_ts, state, updated_at
+                 FROM conns WHERE conn_hash = ?1",
+                params![conn_hash as i64],
+                |r| {
+                    Ok(ConnArchive {
+                        conn_hash: r.get(0)?,
+                        first_ts: r.get(1)?,
+                        last_ts: r.get(2)?,
+                        state: r.get(3)?,
+                        updated_at: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        Ok(v)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -785,6 +842,41 @@ mod tests {
         assert_eq!(rows[0].state, EpochState::Frozen);
         assert_eq!(rows[1].epoch_id, 1);
         assert_eq!(rows[1].dir, "epoch_0001");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn conn_archive_upsert_union_span() {
+        let p = tmpdb("connarch");
+        let l = Ledger::open(&p).unwrap();
+        assert!(l.conn_archive(7).unwrap().is_none());
+
+        l.upsert_conn_archive(&ConnArchive {
+            conn_hash: 7,
+            first_ts: Some(100),
+            last_ts: Some(200),
+            state: 3,
+            updated_at: 1,
+        })
+        .unwrap();
+        let a = l.conn_archive(7).unwrap().unwrap();
+        assert_eq!(a.first_ts, Some(100));
+        assert_eq!(a.last_ts, Some(200));
+
+        // 五元组复用：新代际扩展窗口 → 收敛到并集时间窗。
+        l.upsert_conn_archive(&ConnArchive {
+            conn_hash: 7,
+            first_ts: Some(150),
+            last_ts: Some(300),
+            state: 3,
+            updated_at: 2,
+        })
+        .unwrap();
+        let a = l.conn_archive(7).unwrap().unwrap();
+        assert_eq!(a.first_ts, Some(100), "first_ts 取 MIN");
+        assert_eq!(a.last_ts, Some(300), "last_ts 取 MAX");
+        assert_eq!(a.state, 3);
+        assert_eq!(a.updated_at, 2);
         let _ = std::fs::remove_file(&p);
     }
 }

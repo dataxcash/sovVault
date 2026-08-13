@@ -363,8 +363,21 @@ fn cmd_qr(
         cfg.epoch_max_bytes()?,
     )?;
     let ledger = Ledger::open(&cfg.ledger_path())?;
-    // L1：带时间窗时按 epoch 边界裁剪；无窗 = 全 epoch（裁剪函数内部兜底）。
-    let s = QuerySession::open_with_window(&reg, &ledger, start, end)?;
+    // 连接维度：无显式时间窗时按连接档案（live CONN_STATE / Ledger conns）定位 epoch 子集（L4）；
+    // 有显式时间窗 → 按时间窗裁剪（L1）；无窗无连接 → 全 epoch。
+    let conn_hash = match &conn {
+        Some(h) => Some(
+            u64::from_str_radix(h, 16)
+                .map_err(|_| anyhow::anyhow!("非法连接哈希: {}（需 hex u64）", h))?,
+        ),
+        None => None,
+    };
+    let s = match conn_hash {
+        Some(h) if start.is_none() && end.is_none() => {
+            QuerySession::open_for_conn(&reg, &ledger, h)?
+        }
+        _ => QuerySession::open_with_window(&reg, &ledger, start, end)?,
+    };
     let status = match status {
         Some(raw) => Some(
             QrStatus::parse(&raw)
@@ -402,13 +415,6 @@ fn cmd_qr(
     }
 
     // 连接维度 / 时间维度。
-    let conn_hash = match &conn {
-        Some(h) => Some(
-            u64::from_str_radix(h, 16)
-                .map_err(|_| anyhow::anyhow!("非法连接哈希: {}（需 hex u64）", h))?,
-        ),
-        None => None,
-    };
     let f = QrFilter {
         conn_hash,
         start_ts: start,

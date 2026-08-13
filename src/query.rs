@@ -115,6 +115,7 @@ struct OpenedEpoch {
 }
 
 /// epoch 候选目标（L1 裁剪后保留的子集）。
+#[derive(Clone)]
 struct EpochTarget {
     num: u32,
     dir: std::path::PathBuf,
@@ -137,8 +138,11 @@ pub struct QuerySession {
     /// 当前 epoch 快照（写 env 克隆，保证一致快照）。
     cur_txn: heed::RoTxn<'static, heed::WithTls>,
     cur_dbs: [Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
-    /// 候选 epoch（含当前；升序；已按时间窗裁剪）。
+    /// 候选 epoch（含当前；升序；已按时间窗/连接档案裁剪）——**范围扫描**使用。
     targets: Vec<EpochTarget>,
+    /// 全部 epoch（升序）——**点查**使用（QR_PAIR 终态可能因 TTL 迁移到裁剪集外的晚 epoch，
+    /// 点查必须全量枚举才正确；O(logN) 惰性重开，成本可控）。
+    all_targets: Vec<EpochTarget>,
     map_size: usize,
 }
 
@@ -160,6 +164,44 @@ impl QuerySession {
         QuerySession::build(reg, Some(ledger), start_ts, end_ts)
     }
 
+    /// L4：连接维度路由（DIAG/ROOT CAUSE）——按连接档案定位 epoch 子集再扫，避免全 epoch 枚举。
+    /// 窗口 = live CONN_STATE 的 first_ts..last_ts（真源，连接热状态常驻 live）；
+    /// 不在 live → 回退 Ledger `conns` 档案（连接关闭后的持久记录）。
+    pub fn open_for_conn(reg: &DbRegistry, ledger: &Ledger, conn_hash: u64) -> Result<QuerySession> {
+        match QuerySession::conn_window(reg, ledger, conn_hash)? {
+            Some((first_ts, last_ts)) => {
+                QuerySession::build(reg, Some(ledger), Some(first_ts), Some(last_ts))
+            }
+            None => QuerySession::build(reg, None, None, None),
+        }
+    }
+
+    /// 连接时间窗：live CONN_STATE 优先，Ledger 档案兜底。
+    fn conn_window(
+        reg: &DbRegistry,
+        ledger: &Ledger,
+        conn_hash: u64,
+    ) -> Result<Option<(u64, u64)>> {
+        let lt = reg.live_read_txn()?;
+        let st = reg.live_dbs()[LIVE_CONN_STATE]
+            .get(&lt, &k_conn_state(conn_hash))?
+            .and_then(ConnState::from_bytes);
+        drop(lt);
+        if let Some(st) = st {
+            if st.first_ts > 0 && st.last_ts > 0 {
+                return Ok(Some((st.first_ts, st.last_ts)));
+            }
+        }
+        if let Some(a) = ledger.conn_archive(conn_hash)? {
+            if let (Some(f), Some(l)) = (a.first_ts, a.last_ts) {
+                if f > 0 && l > 0 {
+                    return Ok(Some((f as u64, l as u64)));
+                }
+            }
+        }
+        Ok(None)
+    }
+
     fn build(
         reg: &DbRegistry,
         ledger: Option<&Ledger>,
@@ -171,7 +213,7 @@ impl QuerySession {
         let cur_txn = reg.epoch_env().clone().static_read_txn()?;
         let cur_dbs = *reg.epoch_dbs();
 
-        let mut targets: Vec<EpochTarget> = reg
+        let all_targets: Vec<EpochTarget> = reg
             .epoch_targets()
             .into_iter()
             .map(|(num, dir)| EpochTarget {
@@ -180,6 +222,7 @@ impl QuerySession {
                 is_current: num == reg.epoch_num(),
             })
             .collect();
+        let mut targets = all_targets.clone();
         if let Some(ledger) = ledger {
             targets = prune_targets_by_window(targets, ledger, start_ts, end_ts)?;
         }
@@ -190,6 +233,7 @@ impl QuerySession {
             cur_txn,
             cur_dbs,
             targets,
+            all_targets,
             map_size: reg.map_size(),
         })
     }
@@ -203,14 +247,16 @@ impl QuerySession {
         Ok(OpenedEpoch { txn, dbs })
     }
 
-    /// 跨全部候选 epoch 的 O(logN) 点查（当前 epoch 快照 + 历史惰性重开），先命中即返回。
+    /// 跨全部 epoch 的 O(logN) 点查（当前 epoch 快照 + 历史惰性重开），先命中即返回。
+    /// L4：点查用 `all_targets`（全量）——QR_PAIR 终态可能因 TTL 扫描迁移到裁剪集外的晚 epoch，
+    /// 点查必须全量枚举才正确（范围扫描用裁剪后的 `targets`）。
     fn epoch_get<T>(
         &self,
         db_idx: usize,
         key: &[u8],
         decode: impl Fn(&[u8]) -> Option<T>,
     ) -> Result<Option<T>> {
-        for t in &self.targets {
+        for t in &self.all_targets {
             let hit: Option<T> = if t.is_current {
                 self.cur_dbs[db_idx]
                     .get(&self.cur_txn, key)?
@@ -1073,6 +1119,65 @@ mod tests {
         let f = RecordFilter { start_ts: Some(base + 50), end_ts: None };
         let n2 = stream_records(&reg, &f, &mut sink).unwrap();
         assert_eq!(n2, 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L4：连接维度路由——按连接时间窗裁剪 epoch 子集，避免全 epoch 枚举。
+    /// 点查（QR_PAIR 回查）仍走全量 epoch，TTL 迁移到裁剪集外的终态仍可回跳。
+    #[test]
+    fn conn_routing_prunes_epochs_by_conn_window() {
+        use crate::connection::conn_hash as chash;
+        use crate::ledger::{EpochBoundary, EpochState, Ledger};
+        let dir = tmpdir("connroute");
+        let root = dir.join("qridx");
+        let mut reg = DbRegistry::open(&root, 16 * 1024 * 1024).unwrap();
+        let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
+        let base = 1_700_000_000_000_000_000u64;
+
+        // epoch_0000：conn X（ch）的握手 + 3 Q，ts ∈ [base, base+60]。
+        seed(&reg);
+        let (min0, max0, cnt0) = reg.current_epoch_bounds().unwrap();
+        ledger
+            .upsert_epoch_boundary(&EpochBoundary {
+                epoch_id: 0,
+                dir: "epoch_0000".into(),
+                min_ts: min0.map(|v| v as i64),
+                max_ts: max0.map(|v| v as i64),
+                record_count: cnt0 as i64,
+                state: EpochState::Frozen,
+            })
+            .unwrap();
+        reg.rotate_epoch().unwrap();
+
+        // epoch_0001（当前）：conn Y（8443 端口），ts ∈ [base+1000, base+1002]。
+        let sy = pkt(CIP, SIP, CPORT, 8443, 6, TCP_SYN, base + 1000, 1, 0, b"");
+        let sya = pkt(SIP, CIP, 8443, CPORT, 6, TCP_SYN | TCP_ACK, base + 1001, 5000, 2, b"");
+        let ay = pkt(CIP, SIP, CPORT, 8443, 6, TCP_ACK, base + 1002, 2, 5001, b"");
+        let recs: Vec<(WalRecord, u32)> = vec![sy, sya, ay]
+            .into_iter()
+            .enumerate()
+            .map(|(i, r)| (r, (i as u32) * 100))
+            .collect();
+        run(&reg, &recs);
+
+        // conn X 窗口 [base, base+60] → epoch_0000 命中 + 当前 epoch_0001 → 2。
+        let h_x = ch();
+        let s = QuerySession::open_for_conn(&reg, &ledger, h_x).unwrap();
+        assert_eq!(s.targets.len(), 2, "conn X 命中 epoch_0000");
+        assert_eq!(s.targets[0].num, 0);
+        drop(s);
+
+        // conn Y 窗口 [base+1000, base+1002] → epoch_0000 不命中被裁剪 → 仅当前 epoch_0001。
+        let h_y = chash(1, u32::from_be_bytes(CIP), CPORT, u32::from_be_bytes(SIP), 8443, 6);
+        let s = QuerySession::open_for_conn(&reg, &ledger, h_y).unwrap();
+        assert_eq!(s.targets.len(), 1, "conn Y 应裁剪掉 epoch_0000");
+        assert_eq!(s.targets[0].num, 1);
+        assert!(s.targets[0].is_current);
+
+        // 裁剪会话内范围扫描可跑（conn Y 无 Q → 0 行）；点查走全量 epoch 不受裁剪影响。
+        let f = QrFilter { conn_hash: Some(h_y), ..Default::default() };
+        let r = s.scan_conn_qr(&f, &Page::default()).unwrap();
+        assert!(r.rows.is_empty());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

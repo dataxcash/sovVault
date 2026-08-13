@@ -22,7 +22,7 @@ use crate::db::{DbRegistry, RecordSummary};
 use crate::id;
 use crate::ledger::{AnomalyEvent, FileKind, FileState, Ledger};
 use crate::meta::{ExtMetaEvent, MetaRegistry};
-use crate::qr::{QrMatcher, QrParams};
+use crate::qr::{ConnArchiveEvent, QrMatcher, QrParams};
 use anyhow::{Context, Result};
 use sov_probe::wal::header::WalRecord;
 use std::collections::HashMap;
@@ -73,23 +73,23 @@ pub fn stage_lmdb(
     records: &[IndexedRecord],
     params: &QrParams,
 ) -> Result<Vec<AnomalyEvent>> {
-    stage_lmdb_with_meta(reg, records, params, None).map(|(a, _)| a)
+    stage_lmdb_with_meta(reg, records, params, None).map(|(a, _, _)| a)
 }
 
-/// P5：带 MetaRegistry 的 LMDB 阶段——连接绑定 + 协议键/伪键提取，返回 (审计事件, EXT META 指纹)。
+/// P5：带 MetaRegistry 的 LMDB 阶段——连接绑定 + 协议键/伪键提取，返回 (审计, EXT META, 连接档案)。
 pub fn stage_lmdb_with_meta(
     reg: &DbRegistry,
     records: &[IndexedRecord],
     params: &QrParams,
     meta: Option<&MetaRegistry>,
-) -> Result<(Vec<AnomalyEvent>, Vec<ExtMetaEvent>)> {
+) -> Result<(Vec<AnomalyEvent>, Vec<ExtMetaEvent>, Vec<ConnArchiveEvent>)> {
     let mut m = QrMatcher::begin_with_meta(reg, params, meta)?;
     for r in records {
         m.ingest(r)?;
     }
     let ext_meta = m.ext_meta_events().to_vec();
-    let anomalies = m.commit()?;
-    Ok((anomalies, ext_meta))
+    let out = m.commit()?;
+    Ok((out.anomalies, ext_meta, out.conn_archives))
 }
 
 /// ② SQLite 阶段：按文件聚合推进水位线（每文件取本批最大已提交字节边界）。
@@ -120,6 +120,7 @@ pub fn commit_batch(
 }
 
 /// P5：带 MetaRegistry 的完整提交协议。EXT META 指纹台账在 SQLite 阶段幂等 upsert（best-effort）。
+/// L4：到终态连接的档案（conns 表）在 SQLite 阶段幂等 upsert（best-effort，不阻塞提交协议）。
 pub fn commit_batch_with_meta(
     reg: &DbRegistry,
     ledger: &Ledger,
@@ -127,7 +128,8 @@ pub fn commit_batch_with_meta(
     params: &QrParams,
     meta: Option<&MetaRegistry>,
 ) -> Result<(Vec<AnomalyEvent>, Vec<ExtMetaEvent>)> {
-    let (anomalies, ext_meta) = stage_lmdb_with_meta(reg, records, params, meta)?;
+    let (anomalies, ext_meta, conn_archives) =
+        stage_lmdb_with_meta(reg, records, params, meta)?;
     stage_sqlite(ledger, records)?;
     if let Err(e) = ledger.insert_anomalies(&anomalies) {
         tracing::warn!("审计事件入库失败: {}", e);
@@ -142,6 +144,17 @@ pub fn commit_batch_with_meta(
             now_secs(),
         ) {
             tracing::warn!("EXT META 指纹台账入库失败: {}", e);
+        }
+    }
+    for a in &conn_archives {
+        if let Err(e) = ledger.upsert_conn_archive(&crate::ledger::ConnArchive {
+            conn_hash: a.conn_hash as i64,
+            first_ts: Some(a.first_ts as i64),
+            last_ts: Some(a.last_ts as i64),
+            state: a.state as i64,
+            updated_at: now_secs(),
+        }) {
+            tracing::warn!("连接档案入库失败: {}", e);
         }
     }
     Ok((anomalies, ext_meta))

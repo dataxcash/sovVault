@@ -29,6 +29,8 @@
 
 use crate::batch::IndexedRecord;
 use crate::connection::{anomaly, conn_hash, ConnState, ConnStateKind};
+use crate::ledger::AnomalyEvent;
+use crate::anomaly::{ANOM_QR_RST_ABORT, ANOM_QR_UNMATCHED};
 use crate::db::{
     put_no_overwrite, v_pending_ttl_encode, v_qr_pending_decode, v_qr_pending_encode,
     v_record_summary_encode, v_secondary_encode, DbRegistry, QrPairValue, QrStatus, RecordSummary,
@@ -37,8 +39,6 @@ use crate::db::{
     k_packet_qr, k_pending_ttl, k_qr_key, k_qr_pair, k_qr_pending, k_qr_pending_prefix, k_qr_time,
     k_record_ts,
 };
-use crate::ledger::AnomalyEvent;
-use crate::anomaly::{ANOM_QR_RST_ABORT, ANOM_QR_UNMATCHED};
 use crate::meta::{ExtMetaEvent, MetaRegistry, ProtocolKind};
 use anyhow::Result;
 use heed::types::Bytes;
@@ -223,6 +223,25 @@ pub struct QrMatcher<'e> {
     meta: Option<&'e MetaRegistry>,
     /// P5：连接首次绑定收集的协议指纹（低频），供调用方落 ext_meta 台账。
     ext_meta: Vec<ExtMetaEvent>,
+    /// L4：到终态（Closed/Reset/Timeout/Quarantined）的连接档案事件（供调用方落 Ledger conns 表）。
+    conn_archives: Vec<ConnArchiveEvent>,
+}
+
+/// L4：连接档案事件——连接到终态时聚合写一次（first_ts/last_ts），供 DIAG 定位 epoch 子集。
+#[derive(Debug, Clone)]
+pub struct ConnArchiveEvent {
+    pub conn_hash: u64,
+    pub first_ts: u64,
+    pub last_ts: u64,
+    /// ConnStateKind 原始值（Closed/Reset/Timeout/Quarantined）。
+    pub state: u8,
+}
+
+/// 提交结果：审计事件 + 连接档案事件（调用方在 SQLite 阶段落库）。
+#[derive(Debug, Default)]
+pub struct CommitOutcome {
+    pub anomalies: Vec<AnomalyEvent>,
+    pub conn_archives: Vec<ConnArchiveEvent>,
 }
 
 impl<'e> QrMatcher<'e> {
@@ -248,15 +267,19 @@ impl<'e> QrMatcher<'e> {
             anomalies: Vec::new(),
             meta,
             ext_meta: Vec::new(),
+            conn_archives: Vec::new(),
         })
     }
 
-    /// 提交：写回全部连接热状态（live）→ epoch 先行 → live 殿后 → 返回审计事件（调用方落 SQLite）。
-    pub fn commit(mut self) -> Result<Vec<AnomalyEvent>> {
+    /// 提交：写回全部连接热状态（live）→ epoch 先行 → live 殿后 → 返回审计 + 连接档案事件。
+    pub fn commit(mut self) -> Result<CommitOutcome> {
         self.writeback_conns()?;
         self.epoch_txn.commit()?;
         self.live_txn.commit()?;
-        Ok(self.anomalies)
+        Ok(CommitOutcome {
+            anomalies: self.anomalies,
+            conn_archives: self.conn_archives,
+        })
     }
 
     /// P5：本批收集的连接级 EXT META 指纹事件（commit 前读取）。
@@ -799,6 +822,8 @@ impl<'e> QrMatcher<'e> {
 
     /// 写回连接热状态（live 库）。qr_open 以「live QR_PENDING 行数」兜底校准：
     /// 崩溃窗口下增量递减可能漂移，但 QR_PENDING 是"在途"的单一真源，重算即幂等收敛。
+    /// L4：到终态（Closed/Reset/Timeout/Quarantined）的连接顺手产出档案事件
+    /// （first_ts/last_ts 为最终值），供 SQLite 阶段落 conns 表——DIAG 检索定位 epoch 子集。
     fn writeback_conns(&mut self) -> Result<()> {
         let db = self.live_dbs[LIVE_CONN_STATE];
         let mut keys: Vec<u64> = self.conns.keys().copied().collect();
@@ -807,6 +832,14 @@ impl<'e> QrMatcher<'e> {
             let mut st = self.conns.get(&h).unwrap().state;
             st.qr_open = self.count_live_pending(h)?;
             db.put(&mut self.live_txn, &k_conn_state(h), &st.to_bytes())?;
+            if is_terminal(st.state) {
+                self.conn_archives.push(ConnArchiveEvent {
+                    conn_hash: h,
+                    first_ts: st.first_ts,
+                    last_ts: st.last_ts,
+                    state: st.state,
+                });
+            }
         }
         Ok(())
     }
@@ -829,6 +862,15 @@ impl<'e> QrMatcher<'e> {
 fn req_key_of(rec: &WalRecord) -> Vec<u8> {
     let n = rec.payload.len().min(32);
     rec.payload[..n].to_vec()
+}
+
+/// L4：连接是否到终态（可归档）。Closed/Reset/Timeout/Quarantined——first_ts/last_ts 已最终化。
+#[inline]
+fn is_terminal(state: u8) -> bool {
+    state == ConnStateKind::Closed as u8
+        || state == ConnStateKind::Reset as u8
+        || state == ConnStateKind::Timeout as u8
+        || state == ConnStateKind::Quarantined as u8
 }
 
 /// PACKET_QR value（q_first_idx 8B BE，与 §13.4.1 次级索引 value 语义一致）。
@@ -906,7 +948,7 @@ mod tests {
             };
             m.ingest(&r).unwrap();
         }
-        m.commit().unwrap()
+        m.commit().unwrap().anomalies
     }
 
     fn ch() -> u64 {
@@ -1270,6 +1312,40 @@ mod tests {
         assert_eq!(cs.state, ConnStateKind::Reset as u8);
         assert_ne!(cs.anomaly_flags & anomaly::RESET, 0);
         assert_eq!(cs.qr_open, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L4：RST → 连接到终态（Reset）→ commit 产出连接档案事件（供 Ledger conns 表落库）。
+    #[test]
+    fn terminal_conn_emits_archive_event() {
+        let dir = tmpdir("arch");
+        let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
+        let params = QrParams::default();
+        let mut o = Offset(0);
+        let q = c2s(1001, 5001, b"GET /a");
+        let q_idx = (1u64 << 32) | o.next(&q) as u64;
+        let r = pkt(SIP, CIP, SPORT, CPORT, TCP_RST | TCP_ACK, 5001, 1011, b"");
+        let mut m = QrMatcher::begin(&reg, &params).unwrap();
+        for (rec, off) in [
+            (pkt(CIP, SIP, CPORT, SPORT, TCP_SYN, 1000, 0, b""), o.next(&c2s(1000, 0, b""))),
+            (pkt(SIP, CIP, SPORT, CPORT, TCP_SYN | TCP_ACK, 5000, 1001, b""), o.next(&s2c(5000, 1001, b""))),
+            (q.clone(), q_idx as u32),
+            (r, o.next(&s2c(5001, 1011, b""))),
+        ] {
+            m.ingest(&IndexedRecord {
+                dev_id: 1,
+                file_id: 1,
+                offset: off,
+                rec,
+            })
+            .unwrap();
+        }
+        let out = m.commit().unwrap();
+
+        let arch = out.conn_archives.iter().find(|a| a.conn_hash == ch()).unwrap();
+        assert_eq!(arch.state, ConnStateKind::Reset as u8);
+        assert!(arch.first_ts <= arch.last_ts);
+        assert!(arch.first_ts > 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

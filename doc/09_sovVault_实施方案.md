@@ -606,6 +606,30 @@ reader slot/mmap 随用随放）；仅 live + 当前 epoch 克隆 `DbRegistry` �
 | `query.rs` | `replay_scan` / `QuerySession::replay_into_sink` / `replay_epoch_range`（单次 range 流式喂行） |
 | `export.rs` | `PcapSink` 实现 `ExportSink`；`export_pcap` 改用 `replay_scan`（删分页循环） |
 
+### 13.5.3 连接维度路由（v0.4.1 L4 落地）★
+
+> 背景：历史 conn 检索（DIAG/ROOT CAUSE）跨 epoch 枚举 CONN_QR，epoch 数一多即退化全扫。
+> 且 QR_PAIR 终态可能因 **TTL 扫描在墙钟时刻**迁移到连接记录时间窗之外的晚 epoch——纯按
+> 时间窗裁剪点查会丢数据。
+
+**L4 `open_for_conn(reg, ledger, conn_hash)`**（`query.rs`）：
+- **档案写**：`QrMatcher::writeback_conns` 对到终态（Closed/Reset/Timeout/Quarantined）的连接产出
+  `ConnArchiveEvent`，`commit_batch_with_meta` 幂等 upsert 进 Ledger `conns` 表
+  （first_ts/last_ts 取 MIN/MAX 并集，五元组复用收敛到并集时间窗）。
+- **档案读**：连接时间窗 = live `CONN_STATE` first_ts..last_ts（真源，热状态常驻 live）→ 兜底
+  Ledger `conns` 档案。窗口命中 L1 边界索引 → 只挑 epoch 子集再扫，避免全 epoch 枚举。
+- **正确性（★）**：会话分两表——**范围扫描用裁剪后的 `targets`**，**点查用全量 `all_targets`**。
+  TTL 迁移到裁剪集外晚 epoch 的 QR_PAIR 终态，点查仍全量枚举回跳（O(logN) 惰性重开，成本可控）；
+  范围扫描（CONN_QR/QR_TIME/RECORD_TS）才是裁剪赢面所在。
+
+| 模块 | 改动 |
+|---|---|
+| `ledger.rs` | `conns` 表 + `ConnArchive` + `upsert_conn_archive`（MIN/MAX 并集）/ `conn_archive` |
+| `qr.rs` | `ConnArchiveEvent`/`CommitOutcome`；`writeback_conns` 终态连接产出档案事件 |
+| `batch.rs` | `stage_lmdb_with_meta` 返回 3 元组；`commit_batch_with_meta` 落 conns 表 |
+| `query.rs` | `open_for_conn`/`conn_window`；会话分 `targets`（扫描）/`all_targets`（点查） |
+| `main.rs` | `cmd_qr` 连接维度无显式窗 → `open_for_conn` |
+
 ### 13.6 配置与 CLI
 
 ```toml
