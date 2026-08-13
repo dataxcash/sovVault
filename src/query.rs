@@ -330,6 +330,29 @@ impl QuerySession {
         Ok(paged(&raw, rows, page.limit))
     }
 
+    /// L3：单次流式扫描 RECORD_TS（时间窗）连续喂给 sink——不经分页框架。
+    /// 每个 epoch 内单次 range 迭代，键值就地解码（不重建迭代器、无游标往返）；
+    /// 返回喂给 sink 的行数。`sink.finish()` 由调用方负责。
+    pub fn replay_into_sink<S: ExportSink>(
+        &self,
+        start_ts: Option<u64>,
+        end_ts: Option<u64>,
+        sink: &mut S,
+    ) -> Result<u64> {
+        let (lo, hi) = ts_bounds(start_ts, end_ts);
+        let mut total = 0u64;
+        for t in &self.targets {
+            if t.is_current {
+                replay_epoch_range(&self.cur_txn, &self.cur_dbs, &lo, &hi, sink, &mut total)?;
+            } else {
+                let o = self.open_epoch(t.num, &t.dir)?;
+                replay_epoch_range(&o.txn, &o.dbs, &lo, &hi, sink, &mut total)?;
+                drop(o);
+            }
+        }
+        Ok(total)
+    }
+
     fn live_dbs(&self) -> &[Database<Bytes, Bytes>; crate::db::NUM_LIVE_DBIS] {
         &self.live_dbs
     }
@@ -510,24 +533,59 @@ pub fn stream_records<S: ExportSink>(
     sink: &mut S,
 ) -> Result<u64> {
     let s = QuerySession::open(reg)?;
-    let mut page = Page::default();
-    let mut total = 0u64;
-    loop {
-        let r = s.scan_records(f, &page)?;
-        for row in &r.rows {
-            sink.record(row)?;
-            total += 1;
-        }
-        if !r.has_more {
-            break;
-        }
-        page.cursor = r.next_cursor;
-    }
+    let n = s.replay_into_sink(f.start_ts, f.end_ts, sink)?;
     sink.finish()?;
-    Ok(total)
+    Ok(n)
+}
+
+/// L3：REPLAY 专用流式路径——直接按 epoch 边界裁剪 + 单次 range 迭代连续喂给 sink。
+///
+/// 与 `stream_records`（分页框架）的区别：**不做分页、不重建迭代器、无游标往返**。
+/// - L1 裁剪：`open_with_window` 只挑时间窗内命中的 epoch（无窗/无边界/当前恒全扫）；
+/// - 每个 epoch 内**单次 range** 遍历 `RECORD_TS`，键值就地解码（零额外分配喂行）连续喂 `sink.record`；
+/// - 输出即「时间序连续原始流量」（epoch 升序 + 库内键序），供 REPLAY 加速回放直连；
+/// - `sink.finish()` 由调用方负责（PcapSink 需在 finish 时 flush 并返回统计）。
+///
+/// 返回喂给 sink 的行数。
+pub fn replay_scan<S: ExportSink>(
+    reg: &DbRegistry,
+    ledger: &Ledger,
+    start_ts: Option<u64>,
+    end_ts: Option<u64>,
+    sink: &mut S,
+) -> Result<u64> {
+    let s = QuerySession::open_with_window(reg, ledger, start_ts, end_ts)?;
+    s.replay_into_sink(start_ts, end_ts, sink)
 }
 
 // --- 内部：键区间构造 + 原始分页扫描 ---
+
+/// L3：单 epoch 内 RECORD_TS 单次 range 流式喂行（键值就地解码，零额外分配）。
+fn replay_epoch_range<S: ExportSink>(
+    txn: &heed::RoTxn<'static, heed::WithTls>,
+    dbs: &[Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
+    lo: &[u8],
+    hi: &[u8],
+    sink: &mut S,
+    total: &mut u64,
+) -> Result<()> {
+    for item in dbs[EPOCH_RECORD_TS]
+        .range(txn, &(Bound::Included(lo), Bound::Included(hi)))?
+    {
+        let (k, v) = item?;
+        let Some(summary) = v_record_summary_decode(v) else {
+            continue; // 摘要损坏（不应出现）→ 跳过该行。
+        };
+        let row = RecordRow {
+            ts_ns: be64(&k[0..8]),
+            packet_idx: be64(&k[8..16]),
+            summary,
+        };
+        sink.record(&row)?;
+        *total += 1;
+    }
+    Ok(())
+}
 
 /// 单 epoch 内 range/rev_range 扫描（当前 epoch 快照 txn 或惰性重开 txn 通用）。
 /// 游标落在本 epoch 时排他续读；返回「是否已达 limit」。
@@ -966,6 +1024,55 @@ mod tests {
         let f = RecordFilter { start_ts: Some(base + 70), end_ts: None };
         let r = s.scan_records(&f, &Page::default()).unwrap();
         assert!(r.rows.is_empty(), "窗口外无数据");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 收集流式行的测试 sink。
+    struct CountingSink {
+        rows: Vec<RecordRow>,
+    }
+    impl ExportSink for CountingSink {
+        fn qr(&mut self, _row: &QrIndexRow) -> Result<()> {
+            Ok(())
+        }
+        fn record(&mut self, row: &RecordRow) -> Result<()> {
+            self.rows.push(row.clone());
+            Ok(())
+        }
+    }
+
+    /// L3：replay_scan 单次流式——时间升序连续喂行 + 时间窗过滤 + 与分页路径结果一致。
+    #[test]
+    fn replay_scan_single_pass_ordered_and_filtered() {
+        use crate::ledger::Ledger;
+        let dir = tmpdir("replay");
+        let reg = DbRegistry::open(&dir.join("qridx"), 16 * 1024 * 1024).unwrap();
+        let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
+        let base = 1_700_000_000_000_000_000u64;
+        seed(&reg);
+
+        // 全量：9 条 RECORD_TS，时间升序连续喂行。
+        let mut sink = CountingSink { rows: Vec::new() };
+        let n = replay_scan(&reg, &ledger, None, None, &mut sink).unwrap();
+        assert_eq!(n, 9);
+        assert_eq!(n as usize, sink.rows.len());
+        assert!(
+            sink.rows.windows(2).all(|w| w[0].ts_ns <= w[1].ts_ns),
+            "replay 输出时间升序"
+        );
+
+        // 时间窗 [base+50, base+60]：仅 UDP 两条。
+        let mut sink = CountingSink { rows: Vec::new() };
+        let n = replay_scan(&reg, &ledger, Some(base + 50), Some(base + 60), &mut sink).unwrap();
+        assert_eq!(n, 2);
+        assert!(sink.rows.iter().all(|r| r.summary.proto == 17));
+        assert!(sink.rows.iter().all(|r| r.ts_ns >= base + 50 && r.ts_ns <= base + 60));
+
+        // 与分页路径（stream_records）结果一致性：同一窗口 JSONL 行数相同。
+        let mut sink = CountingSink { rows: Vec::new() };
+        let f = RecordFilter { start_ts: Some(base + 50), end_ts: None };
+        let n2 = stream_records(&reg, &f, &mut sink).unwrap();
+        assert_eq!(n2, 2);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

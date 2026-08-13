@@ -588,6 +588,24 @@ reader slot/mmap 随用随放）；仅 live + 当前 epoch 克隆 `DbRegistry` �
 | `ingest/zenoh.rs` | `maybe_rotate_epoch` 冻结前写边界（先写后转，失败不轮转） |
 | `export.rs` / `main.rs` | `export_pcap` / `cmd_query` / `cmd_qr` 走 `open_with_window`（时间窗裁剪） |
 
+### 13.5.2 REPLAY 专用流式路径（v0.4.1 L3 落地）★
+
+> 背景：REPLAY 要的是「按时间序连续字节流 + 数据平面回读」，不是分页列表。
+> 旧 `export_pcap` 走分页框架（`scan_records` + `Page`/`PageRows`/游标往返），每页重建迭代器、
+> 重建 `RawEpochRow` 中间行——窗口大时吞吐受分页开销拖累。
+
+**L3 `replay_scan(reg, ledger, start, end, sink)`**（`query.rs`）：
+- 直接按 epoch 边界裁剪（L1）→ 每个 epoch 内**单次 range** 迭代 `RECORD_TS`，
+  键值就地解码（零额外分配喂行）连续喂 `sink.record`——**不做分页、不重建迭代器、无游标往返**；
+- 输出即「时间序连续原始流量」（epoch 升序 + 库内键序），供 REPLAY 加速回放直连；
+- `PcapSink` 适配 `ExportSink`（`qr` 维度不适用恒 Ok；`record` 走 BPF 过滤 + WalResolver 回读 + 帧合成）；
+- `export_pcap` / `stream_records` 统一改走该路径（`QuerySession::replay_into_sink`）。
+
+| 模块 | 改动 |
+|---|---|
+| `query.rs` | `replay_scan` / `QuerySession::replay_into_sink` / `replay_epoch_range`（单次 range 流式喂行） |
+| `export.rs` | `PcapSink` 实现 `ExportSink`；`export_pcap` 改用 `replay_scan`（删分页循环） |
+
 ### 13.6 配置与 CLI
 
 ```toml
