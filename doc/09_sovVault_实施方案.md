@@ -630,6 +630,23 @@ reader slot/mmap 随用随放）；仅 live + 当前 epoch 克隆 `DbRegistry` �
 | `query.rs` | `open_for_conn`/`conn_window`；会话分 `targets`（扫描）/`all_targets`（点查） |
 | `main.rs` | `cmd_qr` 连接维度无显式窗 → `open_for_conn` |
 
+### 13.5.4 L5 裁决与批量状态解析（v0.4.1 落地）★
+
+> **L5 持久 LRU 缓存被拒**（架构红线：M7 RSS ≤ 256MB）。根因：缓存 ≤4 个历史 epoch env 时，
+> 峰值 RSS = live + 当前 + 4×epoch_max（默认 128MB/epoch ≈ 640MB）直接击穿红线——
+> 而 v0.4 双库分库正是为守这条红线而设计；L2 惰性打开峰值仅 live+当前+1（红线内）。
+> 且 REPLAY 热路径（L3 `replay_scan`）每 epoch 只开一次，本无重复 open。
+
+**替代方案（RSS 安全，零持久句柄）**：`scan_conn_qr` / `scan_time_qr` 的 status 回查改为**批量解析**——
+每 epoch 只打开一次，批量查完本批全部候选（`batch_statuses` / `batch_resolve_epoch`），
+复杂度从 O(N×A)（N=候选数、A=epoch 数，逐候选重开历史 epoch）降到 O(A)；
+点查仍全量枚举 `all_targets`（TTL 迁移到裁剪集外的 QR_PAIR 终态正确回跳）。
+
+| 模块 | 改动 |
+|---|---|
+| `query.rs` | `batch_statuses` / `batch_resolve_epoch`；`scan_conn_qr`/`scan_time_qr` 用批量状态解析 |
+| `query.rs` | 删除 `status_by_main`（逐候选点查，被批量解析取代） |
+
 ### 13.6 配置与 CLI
 
 ```toml

@@ -307,12 +307,15 @@ impl QuerySession {
         };
         let (lo, hi) = conn_qr_bounds(ch, f.start_ts, f.end_ts);
         let raw = self.page_rows_epochs(EPOCH_CONN_QR, lo, hi, page)?;
+        let candidates: Vec<u64> = raw.iter().map(|(_, k, _)| be64(&k[16..24])).collect();
+        // §13.4.1：次级索引 value 不存 status；状态以 QR_PAIR 主行为准（现查）。
+        // 批量解析：每 epoch 只打开一次，查完本批全部候选（避免逐候选重开历史 epoch）。
+        let statuses = self.batch_statuses(&candidates)?;
         let mut rows = Vec::with_capacity(raw.len());
         for (_num, k, _v) in &raw {
             let q_ts = be64(&k[8..16]);
             let q_first_idx = be64(&k[16..24]);
-            // §13.4.1：次级索引 value 不存 status；状态以 QR_PAIR 主行为准（现查）。
-            let Some(status) = self.status_by_main(q_first_idx)? else {
+            let Some(status) = statuses.get(&q_first_idx).copied() else {
                 continue;
             };
             if let Some(sf) = f.status {
@@ -335,11 +338,13 @@ impl QuerySession {
     pub fn scan_time_qr(&self, f: &QrFilter, page: &Page) -> Result<PageRows<QrIndexRow>> {
         let (lo, hi) = ts_bounds(f.start_ts, f.end_ts);
         let raw = self.page_rows_epochs(EPOCH_QR_TIME, lo, hi, page)?;
+        let candidates: Vec<u64> = raw.iter().map(|(_, k, _)| be64(&k[8..16])).collect();
+        let statuses = self.batch_statuses(&candidates)?;
         let mut rows = Vec::with_capacity(raw.len());
         for (_num, k, _v) in &raw {
             let q_ts = be64(&k[0..8]);
             let q_first_idx = be64(&k[8..16]);
-            let Some(status) = self.status_by_main(q_first_idx)? else {
+            let Some(status) = statuses.get(&q_first_idx).copied() else {
                 continue;
             };
             if let Some(sf) = f.status {
@@ -403,12 +408,32 @@ impl QuerySession {
         &self.live_dbs
     }
 
-    /// 状态以 QR_PAIR 主行为准（§13.4.1）：live 在途 → 全部 epoch 终态，先命中即返回。
-    fn status_by_main(&self, q_first_idx: u64) -> Result<Option<QrStatus>> {
-        match self.qr_by_idx(q_first_idx)? {
-            Some(p) => Ok(QrStatus::from_u8(p.status)),
-            None => Ok(None),
+    /// L5-alt：批量解析候选 Q 状态——每 epoch 只打开一次，批量查完本批全部候选，
+    /// 避免逐候选重开历史 epoch（O(N×A) → O(A)，N=候选数 A=epoch 数）。
+    /// 点查仍全量枚举（TTL 迁移到裁剪集外的 QR_PAIR 终态正确回跳）；无持久句柄、峰值 RSS 不变。
+    /// 候选状态缺失（live 清理且全 epoch 均无）→ 不插入 → 扫描时该行被跳过（与旧行为一致）。
+    fn batch_statuses(&self, candidates: &[u64]) -> Result<HashMap<u64, QrStatus>> {
+        let mut out: HashMap<u64, QrStatus> = HashMap::with_capacity(candidates.len());
+        // live 在途（PENDING 真源）。
+        for &c in candidates {
+            if let Some(v) = self.live_dbs()[LIVE_QR_PAIR].get(&self.live_txn, &k_qr_pair(c))? {
+                if let Some(p) = QrPairValue::decode(v) {
+                    if let Some(st) = QrStatus::from_u8(p.status) {
+                        out.insert(c, st);
+                    }
+                }
+            }
         }
+        for t in &self.all_targets {
+            if t.is_current {
+                batch_resolve_epoch(&self.cur_txn, &self.cur_dbs, candidates, &mut out)?;
+            } else {
+                let o = self.open_epoch(t.num, &t.dir)?;
+                batch_resolve_epoch(&o.txn, &o.dbs, candidates, &mut out)?;
+                drop(o);
+            }
+        }
+        Ok(out)
     }
 
     /// 跨 epoch 原始键级扫描：epoch 序号升序 + 库内主键序（§13.9.4 确定性排序）。
@@ -629,6 +654,28 @@ fn replay_epoch_range<S: ExportSink>(
         };
         sink.record(&row)?;
         *total += 1;
+    }
+    Ok(())
+}
+
+/// L5-alt：单 epoch 内批量解析候选 Q 状态——已解析的跳过，其余查本 epoch QR_PAIR 主行。
+fn batch_resolve_epoch(
+    txn: &heed::RoTxn<'static, heed::WithTls>,
+    dbs: &[Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
+    candidates: &[u64],
+    out: &mut HashMap<u64, QrStatus>,
+) -> Result<()> {
+    for &c in candidates {
+        if out.contains_key(&c) {
+            continue;
+        }
+        if let Some(v) = dbs[EPOCH_QR_PAIR].get(txn, &k_qr_pair(c))? {
+            if let Some(p) = QrPairValue::decode(v) {
+                if let Some(st) = QrStatus::from_u8(p.status) {
+                    out.insert(c, st);
+                }
+            }
+        }
     }
     Ok(())
 }
