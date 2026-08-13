@@ -138,11 +138,12 @@ impl<'a> LiveIngest<'a> {
     }
 
     /// 取（或创建）dev 对应的批量流水线。dev_id 隔离落盘目录，避免多探针串段。
+    /// 重启恢复：复用 dev 的 OPEN hot 文件（截断到 SQLite 水位线），杜绝 create_new 撞旧段文件。
     fn pipeline_for(&mut self, dev_id: u32) -> Result<&mut BatchPipeline<'a>> {
         let key = dev_id as i64;
         if !self.pipelines.contains_key(&key) {
             let dev_hot = self.hot_root.join(format!("dev{}", dev_id));
-            let pipe = BatchPipeline::new(
+            let pipe = BatchPipeline::open_or_recover(
                 self.reg,
                 self.ledger,
                 &dev_hot,

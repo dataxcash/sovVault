@@ -1,8 +1,9 @@
 # sovVault 详细实施方案（实施白皮书 v0.2）
 
-> 状态：**待评审** | 版本：v0.3 | 前置依赖：`08_sovVault_设计与实施方案.md`（v0.6）
+> 状态：**待评审** | 版本：v0.4 | 前置依赖：`08_sovVault_设计与实施方案.md`（v0.6）
 > v0.2 变更：新增 **L2.5 单连接 OOO 字节预算**（填补 L1/L2 间的连接维度字节硬闸）——超限先连接内逐出最旧，持续病态升级内部检疫；明确超限绝不注入线上 RST（红线三理由）；L3 升级为连接感知逐出。
 > v0.3 变更：P2 批量原子性落地——`RECORD_TS` 写入提前至 P2（第 9 个 DBI，作为逐条确定性索引锚点/回放收敛依据，查询消费仍留 P3.5）；SQLite 水位线同步策略拍板（常规 NORMAL + 文件边界屏障 durable + hot 截断到水位线重启规则）。
+> **v0.4 变更（核心架构修订）：双库分库轮转——解决 M7 资源红线「sovVault 常驻 RSS ≤ 256MB」**。M7 实测发现 LMDB 共享 mmap 页驻留 RSS ≈ 数据量且内核不可回收（MADV_DONTNEED/MADV_FREE/posix_fadvise/内存压力实测全部无效），单 env 下 RSS 随数据量线性增长必然超红线。v0.4 将索引平面拆分为**常驻活状态库（live）+ 历史分库（epoch）**：活状态（连接状态/在途请求/TTL）永久留驻 live 库（数据量有界），历史索引按 `epoch_max_bytes` 封顶轮转新 env（关闭旧 env 即 munmap 完整回收 RSS）。QR 匹配的跨 epoch 连接通过「QR_PAIR 在途→终态迁移」与「双事务顺序提交 + 确定性键幂等收敛」保证正确性。详见 [§十三](#十三双库分库轮转设计修订v04核心架构修订)。
 > 本文档把架构设计翻译为**可下发的工程实施说明书**：依赖选型 → Crate 结构与职责 → 二进制数据规格 → 核心算法伪代码 → 状态机规格 → 测试清单 → 分阶段里程碑 → 风险与验收。
 
 ---
@@ -375,6 +376,7 @@ subscribe_batches = true   # 批量帧
 subscribe_chunks = false   # 单帧兼容（默认关）
 gap_self_heal = true
 batch_size = 10000         # 一个 LMDB 事务的报文数（文件边界优先截断）
+epoch_max_bytes = "128MB"  # v0.4：单历史 epoch 数据量上限（双库分库轮转，见 §13）
 pending_budget_bytes = "256MB"   # L3 全局乱序兜底
 segment_pending_cap = 0          # L2 单段硬上限；0=默认 segment_size
 conn_pending_cap_bytes = "16MB"  # L2.5 单连接 OOO 字节硬闸；0=不限制
@@ -414,3 +416,182 @@ export_buf_size = 4096      # PCAP 流式导出缓冲（包）
 ---
 
 > 相关文档：`08_sovVault_设计与实施方案.md`（v0.4，本白皮书的架构依据）
+
+---
+
+## 十三、双库分库轮转设计修订（v0.4，核心架构修订）★
+
+> **修订动机（M7 实测硬数据）**：
+> - 现象：sovVault 常驻 RSS 随 LMDB 数据量线性增长（467MB 数据 → 457MB RSS），M7 红线 **RSS ≤ 256MB** 不可达成。
+> - 根因：LMDB 采用 `MAP_SHARED` 共享 mmap，其 mmap 页一旦写入即永久驻留 RSS。实测 MADV_DONTNEED / MADV_FREE / posix_fadvise(POSIX_FADV_DONTNEED) / 3GB 内存压力**全部无效**（RSS 纹丝不动）；`MDB_WRITEMAP` 与稀疏 mmap 只解决磁盘占用、不解决 RSS。
+> - 结论：RSS ≈ 数据量是 LMDB 架构的**数学必然**，单 env 下不可治理。必须**分库**：把"活状态"（量有界）与"历史索引"（量增长）分离，历史按量封顶轮转新 env，关闭旧 env（munmap）即完整回收其 RSS（已验证：drop env 后 RSS 25.9MB→2.2MB）。
+
+### 13.1 双库目录布局
+
+```
+qridx/
+├── live/                 ← 常驻，永不轮转（只存"在途状态"，数据量有界）
+│   ├── data.mdb          DBI: CONN_STATE + QR_PENDING + PENDING_TTL + 在途 QR_PAIR
+│   └── lock.mdb
+├── epoch_0000/           ← 历史分库，追加后只读
+│   ├── data.mdb          DBI: 终态 QR_PAIR + CONN_QR/QR_KEY/QR_TIME/PACKET_QR/RECORD_TS
+│   └── ...
+├── epoch_0001/
+│   └── ...
+└── ledger.db             ← SQLite 管理平面（文件清单/水位线/epoch 边界/审计）
+```
+
+### 13.2 数据归属（9 DBI 生命周期分类 ★ 回答「哪些数据需要延续」）
+
+| DBI | 库 | 写入时机 | 生命周期判定 |
+|---|---|---|---|
+| CONN_STATE | **live** | 每批 `writeback_conns` 覆盖写 | **活状态**：abs_seq 翻译器/计数反复改写；连接关闭/空闲超时清理，量=活跃连接数 |
+| QR_PENDING | **live** | Q 打开写、消费删 | **活状态**：在途请求；量=并发在途（`qr_pending_budget` 已限单连接） |
+| PENDING_TTL | **live** | Q 打开写、消费/TTL 删 | **活状态**：TTL 扫描依据；量=并发在途 |
+| QR_PAIR（status=PENDING） | **live** | Q 打开写 | **半活**：在途；终态时**迁移到 epoch**（见 13.3） |
+| QR_PAIR（status=终态） | **epoch** | 终态迁移写入 | **历史**：追加归档，不再改 |
+| CONN_QR / QR_KEY / QR_TIME | **epoch** | Q 打开写一次（**不含 status**，见 13.4.1） | **历史**：纯追加索引 |
+| PACKET_QR | **epoch** | Q 打开写 | **历史**：追加索引 |
+| RECORD_TS | **epoch** | 每报文写 | **历史**：追加索引 |
+
+**设计原则（回答「保留活状态降低查询工作量」）**：
+- **活状态不复制、永久留驻 live 库**。它本身就是查询热点（在途请求/TTL/连接审计/QR 匹配读-改-写循环）——留驻 live 使这些查询**只查单库、零跨库合并**。
+- **历史索引分 epoch 轮转**。它们纯追加，封存后只读；轮转关闭旧 env 回收 RSS。
+- **live 库大小 = 在途量（有界）**；epoch 库大小按 `epoch_max_bytes` 封顶。常驻 RSS = live 库数据量 + 单 epoch 数据量 + 固定开销，有界可算。
+
+### 13.3 QR_PAIR 在途→终态迁移（正确性核心 ★）
+
+QR 匹配的读-改-写循环跨请求生命周期。Q 打开时 QR_PAIR 处于 PENDING（在途），配完后进入终态（MATCHED/TIMEOUT/UNMATCHED/RST_ABORT/ABORTED_RESOURCE）。双库下：
+
+```
+Q 打开:   QR_PAIR(PENDING) → live 库
+R 消费:   QR_PAIR 读 live → 翻转终态 → 写 epoch 库（当前 epoch）+ 从 live 删
+TTL超时:  QR_PAIR 读 live → 翻转 TIMEOUT → 写 epoch 库 + 从 live 删
+RST级联:  同上（RST_ABORT）
+代际翻转: 同上（UNMATCHED）
+检疫:     同上（ABORTED_RESOURCE）
+```
+
+**跨 epoch 连接延续**：epoch 轮转只发生在历史库；live 库的在途 QR_PAIR 天然延续（迁移写入的是"当时的当前 epoch"）。故 **Q 在 epoch0 打开、R 在 epoch1 到达** → QR_PAIR 始终在 live 被消费 → 终态迁入 epoch1。连接状态（CONN_STATE）同理永不离开 live。**跨 epoch 连接正确性不破坏**。
+
+**代价**：同一连接的不同 Q 可能分散在不同 epoch 库。查询按 `q_first_idx` 主键定位 + 跨库枚举即可，对调用方透明。
+
+### 13.4 双事务顺序提交（原子性模型修订 ★）
+
+`QrMatcher` 由「单 env 单事务」改为「双 env 双事务顺序提交」。**LMDB 不支持跨 env 原子事务**，复用现有 2PC-Lite 的「确定性键 + NO_OVERWRITE + 水位线回放」幂等收敛哲学：
+
+```
+QrMatcher 持有两个 txn：
+  ① live_txn   ← live env 写事务
+  ② epoch_txn  ← 当前 epoch env 写事务
+
+ingest 每条报文：
+  - RECORD_TS → epoch_txn
+  - 连接热状态/QR 匹配读-改-写：
+      CONN_STATE / QR_PENDING / PENDING_TTL / 在途 QR_PAIR 读写在 live_txn
+      终态 QR_PAIR 迁移 + CONN_QR/QR_KEY/QR_TIME/PACKET_QR 写 epoch_txn
+
+commit 顺序（不可颠倒）：
+  ① live_txn.commit()      （在途状态，量小，快）
+  ② epoch_txn.commit()     （历史索引，NO_OVERWRITE 幂等）
+  ③ SQLite 水位线 advance   （管理平面殿后）
+
+失败收敛（回放自愈，同 §5.5）：
+  - ①失败 → ②③未执行 → 整批 abort → 下轮从原水位线重放
+  - ①成功②失败 → ②③未执行 → 水位线未动 → 重放同批：
+      QR_PAIR 确定性键 `q_first_idx` + NO_OVERWRITE → 收敛零脏数据
+  - 崩溃于②后③前 → 水位线指旧位 → 重放收敛（同现有协议）
+```
+
+**原子性语义变化**：从「全有全无」变为「可重放收敛」。正确性由确定性主键 + 幂等写入保证（与现有 SQLite 殿后模型一致），审计事件 best-effort 落库不阻塞协议。
+
+### 13.4.1 次级索引 status 去重（设计点①：跨 epoch 更新矛盾消除）★
+
+**矛盾**：CONN_QR / QR_KEY / QR_TIME 的 value 原存 status（`v_status_encode`），Q 打开时写当前 epoch（PENDING），终态翻转（消费 / TTL / RST / 代际）需更新 status → 但历史 epoch 已冻结关闭，**跨 epoch 无法更新**。
+
+**裁决：次级索引不存 status 语义（解法 B）**：
+- CONN_QR / QR_KEY / QR_TIME / PACKET_QR 的 value 仅作为**存在性 + 定位**（写 q_first_idx 或常量占位），**Q 打开时写一次，永不更新**（纯追加）。
+- status 过滤查询（`qr --status X`）流程改为：**次级索引定位候选 q_first_idx → 回查 QR_PAIR 主行判 status**（`qr_by_idx` 现查）。
+- **依据**：次级索引 status 仅是查询优化（先粗筛避免全量翻页），最终正确性以 QR_PAIR 主行为准（`--detail` 本就回查主行）。删除 status 更新**消除跨 epoch 更新矛盾**，历史库回归「追加后只读」。
+- **代价**：带 `--status` 过滤的查询多一次 O(logN) 主行回查（仅过滤时发生，detail 本需回查）。
+- **实现**：删除 `sync_secondary_status` / `write_secondary_status` 的全部调用（ingest consume/flip 3 处 + TTL timeout 1 处）；`scan_conn_qr` / `scan_time_qr` 的 status 过滤改为「索引定位 + 主行现查」。
+
+### 13.4.2 QR_PAIR 迁移幂等规则（设计点②：重放时序）★
+
+迁移动作 = 「读 live(PENDING) → 写 epoch(终态) → 删 live」，跨两个 txn。**重放时序必须幂等**：
+
+```
+崩溃窗口                 重放时的状态              重放动作
+─────────────────────────────────────────────────────────────────
+迁移前崩溃              live 有 PENDING            正常迁移
+写 epoch 后、删 live 前  live 有 PENDING           先查 epoch：已有 → 跳过迁移（幂等）
+                          epoch 已有终态            再删 live 残留
+删 live 后、水位线前       live 无、epoch 有终态     已收敛，水位线推进即完成
+```
+
+**幂等规则**：重放时对每个 q_first_idx，**先查 epoch 库 QR_PAIR**——存在则跳过迁移（不重复写）、仅清理 live 残留；不存在才走「读 live → 写 epoch → 删 live」。此规则在 ingest 消费/TTL/级联/代际/检疫 五条终态路径统一实现。
+
+### 13.4.3 TTL 扫描跨库读写（补全）★
+
+TTL 扫描（`anomaly.rs`）复用同一套双库模型：
+- **读**：`PENDING_TTL` / `QR_PENDING` / `CONN_STATE` / 在途 `QR_PAIR` 全部在 **live 库**。
+- **写**：翻转终态 QR_PAIR → 迁入 **当前 epoch 库**（同 §13.4.2 幂等规则）；`write_secondary_status` 调用**删除**（§13.4.1）。
+- TTL 扫描本身是后台协程（`run_ttl_loop`），持有 live + 当前 epoch 两个 env 的只读/写事务，与 ingest 主循环的写事务由 LMDB 单写者串行化保证互斥。
+
+### 13.5 epoch 轮转触发与查询路由
+
+**轮转触发**：
+- 每个 epoch 库的 `data.mdb` 实际占用达 `ingest.epoch_max_bytes`（默认 128MB，见 §11 配置）→ 冻结当前 epoch（Ledger 标 ARCHIVED）→ 开新 epoch env。
+- **live 库永不轮转**（在途状态天然有界）。
+- 轮转动作：`flush` 当前批 → 关旧 epoch env（drop → munmap 回收 RSS）→ 建新 epoch env。
+
+**查询路由**：
+| 查询 | 路由 |
+|---|---|
+| 在途请求 / TTL / 连接审计 / QR 匹配 | **只查 live 库**（单库，无跨库） |
+| 历史时间窗 / 连接回溯 / PCAP 导出 | 枚举 `qridx/epoch_*/` 逐个打开聚合（低频交互） |
+| QR 详情（`qr --detail`） | live 库查在途 + epoch 库查终态，按 `q_first_idx` 定位 |
+
+### 13.6 配置与 CLI
+
+```toml
+[ingest]
+epoch_max_bytes = "128MB"   # 单历史 epoch 数据量上限（默认；RSS = live + 单epoch + 固定开销）
+```
+
+- `--lmdb-dir` 语义不变（qridx 父目录）；epoch 子目录 `qridx/epoch_<NNNN>/` 自动管理。
+- 查询/导出子命令自动枚举全部 epoch，无需手动指定。
+
+### 13.7 资源红线推算（M7 验收依据）
+
+| 组成 | 估算 |
+|---|---|
+| live 库（在途状态） | 并发在途请求数 × 变长值，常态数 MB~数十 MB |
+| 当前 epoch 库 | ≤ `epoch_max_bytes`（128MB） |
+| 固定开销（heap/Zenoh/运行时） | 实测 ≈120MB |
+| **常驻 RSS** | **≤ 128MB + 在途 + 120MB ≈ 256MB**（按 128MB epoch 配置） |
+
+> 实测基准（v0.3 单 env）：467MB 数据 → 457MB RSS。v0.4 双库后单 epoch 封顶 128MB，RSS 有界不随历史总量增长。
+
+### 13.8 实现改动清单（工程说明书）
+
+| 模块 | 改动 |
+|---|---|
+| `db.rs` | `DbRegistry` 支持双 env 打开（live + 当前 epoch）；epoch 目录枚举；`real_disk_size()` 暴露（轮转判定） |
+| `qr.rs` | `QrMatcher` 双事务（live_txn + epoch_txn）；QR_PAIR 迁移逻辑；DBI 归属重排；**删除 `sync_secondary_status` 调用（§13.4.1）** |
+| `batch.rs` | `commit_batch` 拆双事务顺序提交；`stage_lmdb` 拆 stage_live / stage_epoch |
+| `anomaly.rs` | TTL 扫描双库模型：读全在 live，终态迁移写当前 epoch（§13.4.3）；**删除 `write_secondary_status` 调用** |
+| `ingest/zenoh.rs` | 轮转触发：epoch 库达上限 → 冻结/开新；持有可替换 `Box<DbRegistry>` |
+| `query.rs` / `export.rs` | 历史查询跨 epoch 枚举聚合；**status 过滤改为「索引定位 + QR_PAIR 主行现查」** |
+| `config.rs` | `epoch_max_bytes`；`lmdb_epoch_dir(s)` |
+| `main.rs` | serve 持有双库；查询子命令枚举 epoch |
+
+### 13.9 风险与回归
+
+1. **QrMatcher 双事务**是核心重构，回归面最大——必须全量 E2E（atomicity/qr_match/ttl_audit/export/meta/p5_stress）回归。
+2. **QR_PAIR 迁移**：迁移动作必须「先查 epoch（幂等判定）→ 读 live(PENDING) → 写 epoch(终态) → 删 live」同序执行，重放时 epoch 已有则跳过（§13.4.2）。
+3. **次级索引 status 去重**：删除 status 更新后，带 `--status` 过滤的查询必须回查 QR_PAIR 主行，防止 status 过滤失效（§13.4.1）。
+4. **查询跨 epoch**：历史查询需枚举所有 epoch 目录，保证确定性排序（epoch 序号升序 + 库内主键序）。
+5. **旧数据兼容**：既有 `qridx/data.mdb` 单库数据需迁移为 `qridx/live/` + `qridx/epoch_0000/`（提供一次性迁移工具，或直接重建索引）。
+
+---

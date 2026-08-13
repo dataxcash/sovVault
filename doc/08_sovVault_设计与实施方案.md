@@ -1,7 +1,14 @@
-# sovVault 设计与实施方案（评审稿 v0.6）
+# sovVault 设计与实施方案（评审稿 v0.7）
 
-> 状态：**待评审** | 版本：v0.6 | 所属：IronSovereign 开源底座（datax.cash）
+> 状态：**待评审** | 版本：v0.7 | 所属：IronSovereign 开源底座（datax.cash）
 > 本文档定义存储中枢 **sovVault**：Zenoh 字节流 → 重组解密 → TCP 连接/QR 对匹配 → 分级存储 → 司法级导出与查询。
+>
+> **v0.7 修订（双库分库轮转，M7 资源红线治本）：**
+> 1. **索引平面拆双库**：常驻 `live` 库（连接热状态 / 在途 QR / TTL，量有界，永不轮转）+ 历史 `epoch_*` 分库（终态 QR / 二级索引 / RECORD_TS，按 `epoch_max_bytes` 封顶轮转）。
+> 2. **动机（M7 实测）**：LMDB `MAP_SHARED` 共享 mmap 页驻留 RSS ≈ 数据量，MADV_DONTNEED/MADV_FREE/posix_fadvise/内存压力实测全部不可回收（467MB 数据 → 457MB RSS，单 env 必超 256MB 红线）；关闭 env（munmap）可完整回收（实测 25.9MB→2.2MB）→ 分库轮转是唯一治本路径。
+> 3. **QR_PAIR 在途→终态迁移**：Q 打开写 live（PENDING），配完/超时/级联/检疫时迁入当前 epoch（终态）；跨 epoch 连接因活状态永居 live 而不破坏。
+> 4. **双事务顺序提交**：`QrMatcher` 由单 env 单事务改为 live_txn 先行 + epoch_txn 殿后，复用确定性键 + NO_OVERWRITE + 水位线回放的幂等收敛哲学，原子性语义从「全有全无」变为「可重放收敛」。
+> 5. 详见 [§十三 双库分库轮转设计修订](#十三双库分库轮转设计修订v07核心架构修订)。
 >
 > **v0.2 修订（响应评审①）：**
 > 1. 存储三平面：数据（File WAL/PCAP）+ 索引（LMDB QRIDX）+ 管理（SQLite 文件清单/水位线/审计）。
@@ -449,6 +456,53 @@ fin_short_timeout_secs = 5  # FIN 半关闭后未决 Q 缩短超时
 | 资源防御 | 四层预算超限 → 内部检疫/段 ERROR/连接内逐出最旧；**无线上 RST 注入**；恶意连接无法耗尽全局资源、不误伤无辜连接 |
 | PCAP | Wireshark 还原握手 + `[Packet size limited]` 精准出现 |
 | 资源 | RSS ≤ 256MB；CPU ≤ 20%（4 核单节点）；LMDB map_size 稀疏不占物理 |
+
+---
+
+## 十三、双库分库轮转设计修订（v0.7，核心架构修订）★
+
+> 本节是 v0.7 对 §5.1「一个 Batch = 一个 LMDB 事务」与 §三「存储三平面定调」的**架构级修订**。
+> 完整工程实施说明见 `09_sovVault_实施方案.md` §十三（DBI 归属表 / QR_PAIR 迁移 / 双事务协议 / 轮转触发 / 资源推算 / 改动清单）。
+
+### 13.1 修订动机（M7 实测）
+
+LMDB `MAP_SHARED` 共享 mmap 页驻留 RSS ≈ 数据量，且**用户态与内核均不可回收**：
+
+| 治理手段 | 实测结果 |
+|---|---|
+| `madvise(MADV_DONTNEED)` | 返回 0，RSS 纹丝不动（仅对私有匿名映射生效） |
+| `madvise(MADV_FREE)` | 返回 0，RSS 不变 |
+| `posix_fadvise(POSIX_FADV_DONTNEED)` | 返回 0，RSS 不变 |
+| 3GB 内存压力（VM 共 4GB） | RSS 457MB 纹丝不动 |
+| `MDB_WRITEMAP` + 稀疏 mmap | 只省磁盘，不省 RSS |
+| **关闭 env（munmap）** | **RSS 25.9MB → 2.2MB 立即回收** ✅ |
+
+→ 唯一治本路径：**分库轮转**。历史数据按量封顶轮转新 env，关闭旧 env 即回收其全部 RSS；活状态留驻常驻小库。
+
+### 13.2 核心设计
+
+**双库布局**：`qridx/live/`（常驻，量有界）+ `qridx/epoch_N/`（历史，追加后只读）。
+
+**数据归属**：活状态（CONN_STATE / QR_PENDING / PENDING_TTL / 在途 QR_PAIR）永久留驻 live；终态 QR_PAIR + 二级索引（CONN_QR / QR_KEY / QR_TIME / PACKET_QR）+ RECORD_TS 按 epoch 追加归档。
+
+**QR_PAIR 迁移**：Q 打开写 live（PENDING）；配完/超时/级联/检疫时读 live → 翻转终态 → 写当前 epoch + 从 live 删。跨 epoch 连接因活状态永居 live 而不破坏正确性。
+
+**双事务顺序提交**：live_txn 先行 → epoch_txn 殿后 → SQLite 水位线；确定性键（`q_first_idx`）+ NO_OVERWRITE + 水位线回放保证幂等收敛。原子性语义从「全有全无」变为「可重放收敛」。
+
+### 13.3 设计文档一致性声明
+
+- **§5.1「一个 Batch = 一个 LMDB 事务」→ 修订为「一个 Batch = live 事务 + epoch 事务顺序提交」**，回放自愈机制（确定性主键 + NO_OVERWRITE）不变、收敛语义不变。
+- **§三「索引平面 LMDB」→ 修订为「索引平面 = 常驻 live 库 + 历史 epoch 分库」**，稀疏 mmap 语义不变。
+- 9 个 DBI 的键值布局（§四）**不变**，仅 DBI 归属 env 变化（见 09 §13.2 表）。
+- 验收标准「资源 RSS ≤ 256MB」在双库下可达成（推算见 09 §13.7）。
+
+### 13.4 设计点裁决（评审补全）★
+
+**① 次级索引 status 去重**：CONN_QR / QR_KEY / QR_TIME 原存 status 需在终态时更新，但历史 epoch 冻结后无法跨 epoch 更新。裁决：**次级索引不存 status 语义**（纯追加定位索引），status 过滤查询改为「索引定位候选 → QR_PAIR 主行现查」。次级索引回归「追加后只读」，彻底消除跨 epoch 更新矛盾。详见 09 §13.4.1。
+
+**② QR_PAIR 迁移幂等**：迁移 =「读 live(PENDING) → 写 epoch(终态) → 删 live」跨两 txn。重放规则：**先查 epoch 已有 → 跳过迁移（幂等）；不存在才迁移**，五条终态路径统一实现。崩溃于「写 epoch 后删 live 前」时靠此收敛。详见 09 §13.4.2。
+
+**③ TTL 扫描跨库读写**：TTL 扫描（anomaly.rs）与 ingest 共用双库模型——读全部 live，终态迁移写当前 epoch，`write_secondary_status` 调用删除。详见 09 §13.4.3。
 
 ---
 

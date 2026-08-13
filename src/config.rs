@@ -74,6 +74,12 @@ pub struct IngestConfig {
     pub conn_pending_cap_bytes: String,
     pub conn_evict_window_secs: u64,
     pub conn_evict_threshold: u32,
+    /// M7 资源红线：单 LMDB epoch 数据量上限（分库轮转治本）。
+    /// LMDB 共享 mmap 页驻留 RSS ≈ 数据量且内核不可回收（实测 MADV_DONTNEED/FREE、
+    /// posix_fadvise、3GB 内存压力全部无效），故按数据量封顶轮转新 epoch：
+    /// 关闭旧 env（munmap）即完整回收其 RSS，常驻 RSS 有界 = epoch 数据量 + 固定开销。
+    /// 默认 128MB：RSS 数据部分 ≤128MB + 固定开销 ≈120MB ≤ 256MB 红线。
+    pub epoch_max_bytes: String,
 }
 
 impl Default for IngestConfig {
@@ -88,6 +94,7 @@ impl Default for IngestConfig {
             conn_pending_cap_bytes: "16MB".into(),
             conn_evict_window_secs: 30,
             conn_evict_threshold: 3,
+            epoch_max_bytes: "128MB".into(),
         }
     }
 }
@@ -245,6 +252,32 @@ impl Config {
         self.storage_root().join(&self.storage.lmdb_dir)
     }
 
+    /// 指定 epoch 的 LMDB 目录：`qridx/epoch_<NNNN>/`。
+    /// 分库轮转（M7 资源红线）：每个 epoch 独立 env，关闭旧 epoch 即回收其 mmap RSS。
+    pub fn lmdb_epoch_dir(&self, epoch: u32) -> PathBuf {
+        self.lmdb_dir().join(format!("epoch_{:04}", epoch))
+    }
+
+    /// 枚举已存在的 epoch 目录（升序）。
+    pub fn lmdb_epoch_dirs(&self) -> Vec<PathBuf> {
+        let base = self.lmdb_dir();
+        let Ok(rd) = std::fs::read_dir(&base) else {
+            return Vec::new();
+        };
+        let mut dirs: Vec<PathBuf> = rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with("epoch_"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        dirs.sort();
+        dirs
+    }
+
     pub fn lmdb_map_size_bytes(&self) -> Result<u64> {
         parse_size(&self.storage.lmdb_map_size)
     }
@@ -255,6 +288,10 @@ impl Config {
 
     pub fn conn_pending_cap_bytes(&self) -> Result<u64> {
         parse_size(&self.ingest.conn_pending_cap_bytes)
+    }
+
+    pub fn epoch_max_bytes(&self) -> Result<u64> {
+        parse_size(&self.ingest.epoch_max_bytes)
     }
 }
 
@@ -323,6 +360,7 @@ mod tests {
         );
         assert_eq!(cfg.pending_budget_bytes().unwrap(), 256 * 1024 * 1024);
         assert_eq!(cfg.conn_pending_cap_bytes().unwrap(), 16 * 1024 * 1024);
+        assert_eq!(cfg.epoch_max_bytes().unwrap(), 128 * 1024 * 1024);
     }
 
     #[test]

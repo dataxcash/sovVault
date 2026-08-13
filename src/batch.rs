@@ -337,6 +337,33 @@ impl<'a> BatchPipeline<'a> {
         self.meta = Some(meta);
     }
 
+    /// 崩溃/重启恢复构造器：复用 dev 的 OPEN hot 文件（截断到 SQLite 水位线），
+    /// 否则新建。live ingest 重启路径必须走此构造，否则 create_new 撞旧段文件崩溃
+    /// （M7 实测：hot/dev1 遗留 segment_0000.wal → create_new AlreadyExists）。
+    #[allow(clippy::too_many_arguments)] // 构造参数均为配置位，扁平可读优先。
+    pub fn open_or_recover(
+        reg: &'a DbRegistry,
+        ledger: &'a Ledger,
+        hot_dir: impl AsRef<Path>,
+        dev_id: i64,
+        segment_seq: u32,
+        segment_size: u64,
+        batch_size: u32,
+        analysis: QrParams,
+    ) -> Result<BatchPipeline<'a>> {
+        let hot =
+            HotFileWriter::open_or_recover(hot_dir, ledger, dev_id, segment_seq, segment_size)?;
+        Ok(BatchPipeline {
+            reg,
+            ledger,
+            hot,
+            pending: Vec::with_capacity(batch_size as usize),
+            batch_size,
+            analysis,
+            meta: None,
+        })
+    }
+
     pub fn push_record(&mut self, rec: WalRecord) -> Result<()> {
         // 文件边界屏障：跨界 → 先强制提交当前批，再轮转封盘（逻辑事务绝不跨物理文件）。
         let rec_len = (64 + rec.payload.len()) as u64;

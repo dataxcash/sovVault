@@ -22,6 +22,7 @@ subscribe_batches = true   # 批量帧
 subscribe_chunks = false   # 单帧兼容（默认关）
 gap_self_heal = true
 batch_size = 10000         # 一个 LMDB 事务的报文数（文件边界优先截断）
+epoch_max_bytes = "128MB"  # M7 资源红线：单 LMDB epoch 数据量上限（分库轮转治本）
 pending_budget_bytes = "256MB"   # L3 全局乱序兜底
 segment_pending_cap = 0          # L2 单段硬上限；0=默认 segment_size
 conn_pending_cap_bytes = "16MB"  # L2.5 单连接 OOO 字节硬闸；0=不限制
