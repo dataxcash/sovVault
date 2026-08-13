@@ -15,8 +15,8 @@ use sov_probe::wal::header::{TCP_ACK, TCP_SYN, WalRecord};
 use sov_vault::batch::IndexedRecord;
 use sov_vault::connection::{ConnState, conn_hash};
 use sov_vault::db::{
-    DbRegistry, QrPairValue, QrStatus, IDX_CONN_STATE, IDX_QR_PAIR, IDX_QR_PENDING, k_conn_state,
-    k_qr_pair, k_qr_pending, k_qr_pending_prefix,
+    DbRegistry, QrPairValue, QrStatus, LIVE_CONN_STATE, LIVE_QR_PENDING, EPOCH_QR_PAIR,
+    k_conn_state, k_qr_pair, k_qr_pending, k_qr_pending_prefix,
 };
 use sov_vault::qr::{QrMatcher, QrParams, U48_MAX, ANOM_EPOCH_REBIRTH};
 use std::ops::Bound;
@@ -101,22 +101,30 @@ fn ch() -> u64 {
 }
 
 fn pair_at(reg: &DbRegistry, q_first_idx: u64) -> Option<QrPairValue> {
-    let txn = reg.read_txn().unwrap();
-    let v = reg.dbs[IDX_QR_PAIR].get(&txn, &k_qr_pair(q_first_idx)).unwrap()?;
+    let txn = reg.epoch_read_txn().unwrap();
+    let v = reg.epoch_dbs()[EPOCH_QR_PAIR]
+        .get(&txn, &k_qr_pair(q_first_idx))
+        .unwrap()?;
     QrPairValue::decode(v)
 }
 
 fn pending_len(reg: &DbRegistry, h: u64, inc: u16) -> u64 {
-    let txn = reg.read_txn().unwrap();
+    let txn = reg.live_read_txn().unwrap();
     let lo = k_qr_pending_prefix(h, inc);
     let hi = k_qr_pending(h, inc, U48_MAX);
     let range = (Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice()));
-    reg.dbs[IDX_QR_PENDING].range(&txn, &range).unwrap().count() as u64
+    reg.live_dbs()[LIVE_QR_PENDING]
+        .range(&txn, &range)
+        .unwrap()
+        .count() as u64
 }
 
 fn conn_state_at(reg: &DbRegistry, h: u64) -> ConnState {
-    let txn = reg.read_txn().unwrap();
-    let v = reg.dbs[IDX_CONN_STATE].get(&txn, &k_conn_state(h)).unwrap().unwrap();
+    let txn = reg.live_read_txn().unwrap();
+    let v = reg.live_dbs()[LIVE_CONN_STATE]
+        .get(&txn, &k_conn_state(h))
+        .unwrap()
+        .unwrap();
     ConnState::from_bytes(v).unwrap()
 }
 

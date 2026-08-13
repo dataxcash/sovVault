@@ -53,8 +53,10 @@ fn qr_params() -> QrParams {
 }
 
 fn rec_ts_count(reg: &DbRegistry) -> u64 {
-    let txn = reg.read_txn().unwrap();
-    reg.dbs[sov_vault::db::IDX_RECORD_TS].len(&txn).unwrap()
+    let txn = reg.epoch_read_txn().unwrap();
+    reg.epoch_dbs()[sov_vault::db::EPOCH_RECORD_TS]
+        .len(&txn)
+        .unwrap()
 }
 
 /// ① 注入提交失败（SQLite 殿后失败）→ 水位线不推进；注册文件后重放 → 收敛。
@@ -163,17 +165,17 @@ fn file_boundary_forces_commit() {
     let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
     // segment_size=80：每条 74B，文件 1 放 1 条，文件 2 放 1 条，文件 3 放 1 条。
     let mut pipe =
-        BatchPipeline::new(&reg, &ledger, dir.join("hot"), 1, 0, 80, 100, qr_params()).unwrap();
+        BatchPipeline::new(&ledger, dir.join("hot"), 1, 0, 80, 100, qr_params()).unwrap();
     let fid1 = pipe.hot_file_id();
-    pipe.push_record(rec(1, &[1u8; 10])).unwrap(); // 文件1
-    pipe.push_record(rec(2, &[2u8; 10])).unwrap(); // 跨界 → 强制提交文件1 + 轮转
+    pipe.push_record(&reg, rec(1, &[1u8; 10])).unwrap(); // 文件1
+    pipe.push_record(&reg, rec(2, &[2u8; 10])).unwrap(); // 跨界 → 强制提交文件1 + 轮转
     let fid2 = pipe.hot_file_id();
     assert_ne!(fid1, fid2);
-    pipe.push_record(rec(3, &[3u8; 10])).unwrap(); // 文件2
-    pipe.push_record(rec(4, &[4u8; 10])).unwrap(); // 跨界 → 强制提交文件2 + 轮转
+    pipe.push_record(&reg, rec(3, &[3u8; 10])).unwrap(); // 文件2
+    pipe.push_record(&reg, rec(4, &[4u8; 10])).unwrap(); // 跨界 → 强制提交文件2 + 轮转
     let fid3 = pipe.hot_file_id();
     assert_ne!(fid2, fid3);
-    pipe.finish().unwrap();
+    pipe.finish(&reg).unwrap();
 
     // 未满 batch_size(100) 但跨界即提交：文件1 水位线 = 74（1 条已入库）。
     assert_eq!(ledger.watermark(fid1 as i64).unwrap(), 74);

@@ -1,47 +1,53 @@
-//! LMDB 索引平面：9 DBI 注册表 + 键值大端编解码。
-//! 键值规格对齐 09_sovVault_实施方案.md §4.2（键一律大端）。
+//! LMDB 索引平面：双库分库轮转（v0.4，09 §13）。
+//! live 库（常驻，量有界）+ 当前 epoch 库（历史，按 `epoch_max_bytes` 轮转）。
+//!
+//! DBI 归属（09 §13.2）：
+//! - **live**：CONN_STATE / QR_PAIR(PENDING) / QR_PENDING / PENDING_TTL —— 活状态永居 live；
+//! - **epoch**：QR_PAIR(终态) / CONN_QR / QR_KEY / QR_TIME / PACKET_QR / RECORD_TS —— 追加后只读，
+//!   轮转关闭旧 env（munmap）即完整回收其 RSS（M7 资源红线 RSS ≤ 256MB 治本）。
+//!
+//! 提交协议（09 §13.4）：epoch 先行（历史索引 NO_OVERWRITE 幂等）→ live 殿后（活状态/残留删除），
+//! 然后 SQLite 水位线 advance。QR_PAIR 迁移幂等规则见 qr.rs / anomaly.rs（§13.4.2）：
+//! 「先查 epoch → 已有则跳过迁移（不重复写）、仅清理 live 残留」。
+//!
+//! > 与 09 §13.4 字面顺序（①live ②epoch）的偏差说明：§13.4.2 幂等规则（正确性核心 ★）要求
+//! > 「写 epoch 后、删 live 前」窗口内重放能收敛——即 epoch 必须先在磁盘上持久、live 残留删除在
+//! > 其后。epoch 先行 + live 残留删除原子（同 live txn）正好满足该表全部三行；若 live 先行则在
+//! > ①成功②失败窗口丢失 QR_PENDING 导致 Q 永久丢失。故取 epoch 先行。
 
 use anyhow::Result;
 use heed::types::Bytes;
-use heed::{Database, Env, EnvOpenOptions, MdbError, PutFlags};
-use std::path::Path;
+use heed::{Database, Env, EnvOpenOptions, EnvFlags, MdbError, PutFlags};
+use std::path::{Path, PathBuf};
 
-/// 8 DBI 名称（09 §4.2 表格顺序）。
-pub const DBI_CONN_STATE: &str = "conn_state";
-pub const DBI_QR_PAIR: &str = "qr_pair";
-pub const DBI_QR_PENDING: &str = "qr_pending";
-pub const DBI_CONN_QR: &str = "conn_qr";
-pub const DBI_QR_KEY: &str = "qr_key";
-pub const DBI_QR_TIME: &str = "qr_time";
-pub const DBI_PACKET_QR: &str = "packet_qr";
-pub const DBI_PENDING_TTL: &str = "pending_ttl";
-/// 报文时间窗索引（09 §4.9）。P2 起作为逐条确定性索引锚点（批量原子性/回放收敛依据），
-/// P3.5 补齐查询/导出消费层。
-pub const DBI_RECORD_TS: &str = "record_ts";
+// --- 双库 DBI 归属 ---
 
-pub const NUM_DBIS: usize = 9;
-const DBI_NAMES: [&str; NUM_DBIS] = [
-    DBI_CONN_STATE,
-    DBI_QR_PAIR,
-    DBI_QR_PENDING,
-    DBI_CONN_QR,
-    DBI_QR_KEY,
-    DBI_QR_TIME,
-    DBI_PACKET_QR,
-    DBI_PENDING_TTL,
-    DBI_RECORD_TS,
+/// live 库 DBI（4）：活状态，永居 live，量有界。
+pub const LIVE_DBI_NAMES: [&str; NUM_LIVE_DBIS] = ["conn_state", "qr_pair", "qr_pending", "pending_ttl"];
+/// epoch 库 DBI（6）：历史索引，追加后只读。
+pub const EPOCH_DBI_NAMES: [&str; NUM_EPOCH_DBIS] = [
+    "qr_pair", "conn_qr", "qr_key", "qr_time", "packet_qr", "record_ts",
 ];
 
-/// DBI 数组下标（与 DBI_NAMES 对齐）。
-pub const IDX_CONN_STATE: usize = 0;
-pub const IDX_QR_PAIR: usize = 1;
-pub const IDX_QR_PENDING: usize = 2;
-pub const IDX_CONN_QR: usize = 3;
-pub const IDX_QR_KEY: usize = 4;
-pub const IDX_QR_TIME: usize = 5;
-pub const IDX_PACKET_QR: usize = 6;
-pub const IDX_PENDING_TTL: usize = 7;
-pub const IDX_RECORD_TS: usize = 8;
+pub const NUM_LIVE_DBIS: usize = 4;
+pub const NUM_EPOCH_DBIS: usize = 6;
+
+// live DBI 下标
+pub const LIVE_CONN_STATE: usize = 0;
+pub const LIVE_QR_PAIR: usize = 1;
+pub const LIVE_QR_PENDING: usize = 2;
+pub const LIVE_PENDING_TTL: usize = 3;
+
+// epoch DBI 下标
+pub const EPOCH_QR_PAIR: usize = 0;
+pub const EPOCH_CONN_QR: usize = 1;
+pub const EPOCH_QR_KEY: usize = 2;
+pub const EPOCH_QR_TIME: usize = 3;
+pub const EPOCH_PACKET_QR: usize = 4;
+pub const EPOCH_RECORD_TS: usize = 5;
+
+/// 默认单 epoch 数据量上限（M7 资源红线推导：RSS ≤ 128MB 数据 + ~120MB 固定开销 ≤ 256MB）。
+pub const DEFAULT_EPOCH_MAX_BYTES: u64 = 128 * 1024 * 1024;
 
 /// QrStatus 枚举（09 §4.2，跨 DBI 一致）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
@@ -283,17 +289,18 @@ pub fn v_qr_pending_decode(b: &[u8]) -> Option<(u64, u64, u32)> {
     ))
 }
 
-// --- CONN_QR/QR_KEY/QR_TIME Value：status:u8（单字节） ---
+// --- CONN_QR/QR_KEY/QR_TIME Value（§13.4.1：不存 status，仅存在性+定位，写 q_first_idx 8B） ---
 
-pub fn v_status_encode(status: QrStatus) -> [u8; 1] {
-    [status as u8]
+/// §13.4.1 次级索引 value：写 q_first_idx（8B BE）作「存在性 + 定位」，Q 打开时写一次、永不更新。
+pub fn v_secondary_encode(q_first_idx: u64) -> [u8; 8] {
+    q_first_idx.to_be_bytes()
 }
 
-pub fn v_status_decode(b: &[u8]) -> Option<QrStatus> {
-    if b.len() != 1 {
+pub fn v_secondary_decode(b: &[u8]) -> Option<u64> {
+    if b.len() != 8 {
         return None;
     }
-    QrStatus::from_u8(b[0])
+    Some(u64::from_be_bytes(b.try_into().ok()?))
 }
 
 // --- PACKET_QR Value：q_first_idx:u64 ---
@@ -431,45 +438,280 @@ impl QrPairValue {
     }
 }
 
-// --- LMDB 环境与 9 DBI 注册表 ---
+// --- 双库环境注册表 ---
 
+/// 双库 DbRegistry：live env + 当前 epoch env。
+///
+/// 目录布局（09 §13.1）：
+/// ```text
+/// qridx/
+/// ├── live/        ← 常驻，永不轮转（活状态，量有界）
+/// ├── epoch_0000/  ← 历史分库，追加后只读
+/// └── epoch_0001/
+/// ```
 pub struct DbRegistry {
-    env: Env,
-    pub dbs: [Database<Bytes, Bytes>; NUM_DBIS],
+    root: PathBuf,
+    map_size: usize,
+    epoch_max_bytes: u64,
+    live: Env,
+    live_dbs: [Database<Bytes, Bytes>; NUM_LIVE_DBIS],
+    epoch: Env,
+    epoch_dbs: [Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
+    epoch_num: u32,
+}
+
+fn open_env(dir: &Path, map_size: usize) -> Result<Env> {
+    std::fs::create_dir_all(dir)?;
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(map_size)
+            .max_dbs(16)
+            .open(dir)?
+    };
+    Ok(env)
+}
+
+/// 打开 env 内全部具名 DBI（CREATE）。
+fn open_dbis(
+    env: &Env<heed::WithTls>,
+    names: &[&str],
+) -> Result<Vec<Database<Bytes, Bytes>>> {
+    let mut txn = env.write_txn()?;
+    let mut dbs = Vec::with_capacity(names.len());
+    for name in names {
+        dbs.push(env.create_database::<Bytes, Bytes>(&mut txn, Some(name))?);
+    }
+    txn.commit()?;
+    Ok(dbs)
+}
+
+/// 打开历史 epoch env（追加后只读，query/export 用）。
+pub fn open_epoch_env_read_only(dir: &Path, map_size: usize) -> Result<Env> {
+    let env = unsafe {
+        EnvOpenOptions::new()
+            .map_size(map_size)
+            .max_dbs(16)
+            .flags(EnvFlags::READ_ONLY)
+            .open(dir)?
+    };
+    Ok(env)
+}
+
+/// 打开历史 epoch env + 同一事务内打开的 DBI 数组（便捷路径；QuerySession 需自行开 txn 时用上面的拆法）。
+pub fn open_epoch_read_only(
+    dir: &Path,
+    map_size: usize,
+) -> Result<(Env, [Database<Bytes, Bytes>; NUM_EPOCH_DBIS])> {
+    let env = open_epoch_env_read_only(dir, map_size)?;
+    let txn = env.read_txn()?;
+    let dbs = open_epoch_dbs_in_txn(&env, &txn)?;
+    drop(txn);
+    Ok((env, dbs))
+}
+
+/// 在指定只读事务内打开全部 epoch DBI（与后续查询同一事务，保证 DBI 有效）。
+pub fn open_epoch_dbs_in_txn(
+    env: &Env,
+    txn: &heed::RoTxn<'_>,
+) -> Result<[Database<Bytes, Bytes>; NUM_EPOCH_DBIS]> {
+    let mut dbs = Vec::with_capacity(NUM_EPOCH_DBIS);
+    for name in EPOCH_DBI_NAMES.iter() {
+        let db = env
+            .open_database::<Bytes, Bytes>(txn, Some(name))?
+            .ok_or_else(|| anyhow::anyhow!("epoch DBI 缺失: {}", name))?;
+        dbs.push(db);
+    }
+    dbs.try_into()
+        .map_err(|_| anyhow::anyhow!("epoch DBI 数量不匹配"))
 }
 
 impl DbRegistry {
+    /// 打开双库：`dir` = qridx 根目录（live/ + epoch_XXXX/ 在其下）。
+    /// 默认 epoch_max_bytes = 128MB。等价于 `open_with(dir, map_size, DEFAULT_EPOCH_MAX_BYTES)`。
     pub fn open(dir: &Path, map_size: usize) -> Result<DbRegistry> {
-        std::fs::create_dir_all(dir)?;
-        let env = unsafe {
-            EnvOpenOptions::new()
-                .map_size(map_size)
-                .max_dbs(16)
-                .open(dir)?
-        };
-        let mut txn = env.write_txn()?;
-        let mut dbs: Vec<Database<Bytes, Bytes>> = Vec::with_capacity(NUM_DBIS);
-        for name in DBI_NAMES.iter() {
-            dbs.push(env.create_database::<Bytes, Bytes>(&mut txn, Some(name))?);
-        }
-        txn.commit()?;
-        let dbs: [Database<Bytes, Bytes>; NUM_DBIS] = dbs
+        DbRegistry::open_with(dir, map_size, DEFAULT_EPOCH_MAX_BYTES)
+    }
+
+    /// 打开双库并指定单 epoch 数据量上限（轮转触发阈值）。
+    pub fn open_with(root: &Path, map_size: usize, epoch_max_bytes: u64) -> Result<DbRegistry> {
+        std::fs::create_dir_all(root)?;
+        let live = open_env(&root.join("live"), map_size)?;
+        let live_dbs = open_dbis(&live, &LIVE_DBI_NAMES)?;
+        let live_dbs: [Database<Bytes, Bytes>; NUM_LIVE_DBIS] = live_dbs
             .try_into()
-            .map_err(|_| anyhow::anyhow!("DBI 数量不匹配"))?;
-        Ok(DbRegistry { env, dbs })
+            .map_err(|_| anyhow::anyhow!("live DBI 数量不匹配"))?;
+
+        // 恢复语义：优先复用已存在的最高 epoch（追加后只读历史 + 当前可写），否则建 epoch_0000。
+        let epoch_num = DbRegistry::highest_epoch(root);
+        let epoch_dir = root.join(format!("epoch_{:04}", epoch_num));
+        let epoch = open_env(&epoch_dir, map_size)?;
+        let epoch_dbs = open_dbis(&epoch, &EPOCH_DBI_NAMES)?;
+        let epoch_dbs: [Database<Bytes, Bytes>; NUM_EPOCH_DBIS] = epoch_dbs
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("epoch DBI 数量不匹配"))?;
+
+        Ok(DbRegistry {
+            root: root.to_path_buf(),
+            map_size,
+            epoch_max_bytes,
+            live,
+            live_dbs,
+            epoch,
+            epoch_dbs,
+            epoch_num,
+        })
     }
 
-    pub fn env(&self) -> &Env {
-        &self.env
+    /// 枚举已存在 epoch 目录（升序，epoch_XXXX）。
+    pub fn epoch_dirs(&self) -> Vec<PathBuf> {
+        epoch_dirs(&self.root)
     }
 
-    pub fn write_txn(&self) -> Result<heed::RwTxn<'_>> {
-        Ok(self.env.write_txn()?)
+    /// 根目录（qridx/）。
+    pub fn root(&self) -> &Path {
+        &self.root
     }
 
-    pub fn read_txn(&self) -> Result<heed::RoTxn<'_, heed::WithTls>> {
-        Ok(self.env.read_txn()?)
+    pub fn map_size(&self) -> usize {
+        self.map_size
     }
+
+    pub fn epoch_max_bytes(&self) -> u64 {
+        self.epoch_max_bytes
+    }
+
+    pub fn live_env(&self) -> &Env {
+        &self.live
+    }
+
+    pub fn epoch_env(&self) -> &Env {
+        &self.epoch
+    }
+
+    pub fn live_dbs(&self) -> &[Database<Bytes, Bytes>; NUM_LIVE_DBIS] {
+        &self.live_dbs
+    }
+
+    pub fn epoch_dbs(&self) -> &[Database<Bytes, Bytes>; NUM_EPOCH_DBIS] {
+        &self.epoch_dbs
+    }
+
+    pub fn epoch_num(&self) -> u32 {
+        self.epoch_num
+    }
+
+    pub fn epoch_dir(&self) -> PathBuf {
+        self.root.join(format!("epoch_{:04}", self.epoch_num))
+    }
+
+    pub fn live_write_txn(&self) -> Result<heed::RwTxn<'_>> {
+        Ok(self.live.write_txn()?)
+    }
+
+    pub fn epoch_write_txn(&self) -> Result<heed::RwTxn<'_>> {
+        Ok(self.epoch.write_txn()?)
+    }
+
+    pub fn live_read_txn(&self) -> Result<heed::RoTxn<'_, heed::WithTls>> {
+        Ok(self.live.read_txn()?)
+    }
+
+    pub fn epoch_read_txn(&self) -> Result<heed::RoTxn<'_, heed::WithTls>> {
+        Ok(self.epoch.read_txn()?)
+    }
+
+    /// 当前 epoch 库实际磁盘占用（data.mdb 大小）。轮转触发阈值（§13.5）。
+    pub fn real_disk_size(&self) -> Result<u64> {
+        Ok(self.epoch.real_disk_size()?)
+    }
+
+    /// epoch 轮转：冻结当前 epoch（保持只读历史），开启下一个 epoch env。
+    /// 旧 env 随字段赋值被 drop → munmap → 完整回收其 RSS（M7 实测 drop env 后 RSS 25.9MB→2.2MB）。
+    /// 调用方必须在无活事务（commit 后）时调用。
+    pub fn rotate_epoch(&mut self) -> Result<u32> {
+        let next = self.epoch_num + 1;
+        let dir = self.root.join(format!("epoch_{:04}", next));
+        let env = open_env(&dir, self.map_size)?;
+        let dbs = open_dbis(&env, &EPOCH_DBI_NAMES)?;
+        let dbs: [Database<Bytes, Bytes>; NUM_EPOCH_DBIS] = dbs
+            .try_into()
+            .map_err(|_| anyhow::anyhow!("epoch DBI 数量不匹配"))?;
+        self.epoch = env;
+        self.epoch_dbs = dbs;
+        self.epoch_num = next;
+        Ok(next)
+    }
+
+    /// 当前 epoch 已满（real_disk_size ≥ epoch_max_bytes）？
+    pub fn epoch_should_rotate(&self) -> Result<bool> {
+        Ok(self.real_disk_size()? >= self.epoch_max_bytes)
+    }
+
+    /// 找出已存在的最高 epoch 序号（无则 0）。
+    fn highest_epoch(root: &Path) -> u32 {
+        let mut max = 0u32;
+        if let Ok(rd) = std::fs::read_dir(root) {
+            for e in rd.flatten() {
+                let name = e.file_name();
+                let Some(s) = name.to_str() else { continue };
+                if let Some(rest) = s.strip_prefix("epoch_") {
+                    if let Ok(n) = rest.parse::<u32>() {
+                        if n >= max {
+                            max = n;
+                        }
+                    }
+                }
+            }
+        }
+        max
+    }
+
+    // --- 跨库只读辅助（测试/查询便捷） ---
+
+    /// QR_PAIR 主行检索：先 live（在途 PENDING）再当前 epoch（终态）。返回 None 表示两库均无。
+    pub fn qr_pair_at(&self, q_first_idx: u64) -> Result<Option<QrPairValue>> {
+        let k = k_qr_pair(q_first_idx);
+        let lt = self.live_read_txn()?;
+        if let Some(v) = self.live_dbs[LIVE_QR_PAIR].get(&lt, &k)? {
+            if let Some(p) = QrPairValue::decode(v) {
+                return Ok(Some(p));
+            }
+        }
+        drop(lt);
+        let et = self.epoch_read_txn()?;
+        if let Some(v) = self.epoch_dbs[EPOCH_QR_PAIR].get(&et, &k)? {
+            return Ok(QrPairValue::decode(v));
+        }
+        Ok(None)
+    }
+
+    /// QR_PAIR 总数（live 在途 + 当前 epoch 终态；历史 epoch 需另行枚举）。
+    pub fn qr_pair_count(&self) -> Result<u64> {
+        let lt = self.live_read_txn()?;
+        let a = self.live_dbs[LIVE_QR_PAIR].len(&lt)?;
+        drop(lt);
+        let et = self.epoch_read_txn()?;
+        let b = self.epoch_dbs[EPOCH_QR_PAIR].len(&et)?;
+        Ok(a + b)
+    }
+}
+
+/// 枚举 qridx 下全部 epoch_XXXX 目录（升序）。
+fn epoch_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Ok(rd) = std::fs::read_dir(root) {
+        for e in rd.flatten() {
+            let path = e.path();
+            let name = e.file_name();
+            if let Some(s) = name.to_str() {
+                if s.starts_with("epoch_") {
+                    dirs.push(path);
+                }
+            }
+        }
+    }
+    dirs.sort();
+    dirs
 }
 
 /// NO_OVERWRITE 幂等写入：键已存在（KeyExist）返回 Ok(false)，否则写入返回 Ok(true)。
@@ -544,18 +786,9 @@ mod tests {
     }
 
     #[test]
-    fn status_value_roundtrip() {
-        for s in [
-            QrStatus::Pending,
-            QrStatus::Matched,
-            QrStatus::Timeout,
-            QrStatus::Unmatched,
-            QrStatus::RstAbort,
-            QrStatus::AbortedResource,
-        ] {
-            assert_eq!(v_status_decode(&v_status_encode(s)).unwrap(), s);
-        }
-        assert!(v_status_decode(&[9]).is_none());
+    fn secondary_value_roundtrip() {
+        assert_eq!(v_secondary_decode(&v_secondary_encode(42)).unwrap(), 42);
+        assert!(v_secondary_decode(&[0u8; 7]).is_none());
     }
 
     #[test]
@@ -611,37 +844,160 @@ mod tests {
     fn put_no_overwrite_idempotent() {
         let dir = tmpdir("nooverwrite");
         let reg = DbRegistry::open(&dir, 10 * 1024 * 1024).unwrap();
-        let mut txn = reg.write_txn().unwrap();
+        let mut txn = reg.epoch_write_txn().unwrap();
         let k = k_record_ts(1, 2);
         let v = v_record_summary_encode(&RecordSummary::default());
         // 首次写入 → true；同键重复写入 → false（幂等收敛依据）。
-        assert!(put_no_overwrite(&reg.dbs[IDX_RECORD_TS], &mut txn, &k, &v).unwrap());
-        assert!(!put_no_overwrite(&reg.dbs[IDX_RECORD_TS], &mut txn, &k, &v).unwrap());
+        assert!(put_no_overwrite(
+            &reg.epoch_dbs()[EPOCH_RECORD_TS],
+            &mut txn,
+            &k,
+            &v
+        )
+        .unwrap());
+        assert!(!put_no_overwrite(
+            &reg.epoch_dbs()[EPOCH_RECORD_TS],
+            &mut txn,
+            &k,
+            &v
+        )
+        .unwrap());
         txn.commit().unwrap();
-        let txn = reg.read_txn().unwrap();
-        assert_eq!(reg.dbs[IDX_RECORD_TS].len(&txn).unwrap(), 1);
+        let txn = reg.epoch_read_txn().unwrap();
+        assert_eq!(
+            reg.epoch_dbs()[EPOCH_RECORD_TS].len(&txn).unwrap(),
+            1
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
-    fn registry_open_all_dbis_and_roundtrip() {
-        let dir = tmpdir("registry");
-        let reg = DbRegistry::open(&dir, 10 * 1024 * 1024).unwrap();
+    fn registry_open_dual_env_layout() {
+        let dir = tmpdir("dual");
+        let root = dir.join("qridx");
+        let reg = DbRegistry::open(&root, 10 * 1024 * 1024).unwrap();
+        // 目录布局：live/ + epoch_0000/。
+        assert!(root.join("live/data.mdb").exists());
+        assert!(root.join("epoch_0000/data.mdb").exists());
+        assert_eq!(reg.epoch_num(), 0);
 
-        let mut txn = reg.write_txn().unwrap();
+        // live 库写 CONN_STATE + QR_PENDING（活状态 DBI）。
+        let mut lt = reg.live_write_txn().unwrap();
         let conn = k_conn_state(123);
-        reg.dbs[0].put(&mut txn, &conn, &[0xAB; 169]).unwrap();
-        let pending = k_qr_pending(123, 0, 456);
-        reg.dbs[2]
-            .put(&mut txn, &pending, &v_qr_pending_encode(9, 10, 11))
+        reg.live_dbs()[LIVE_CONN_STATE]
+            .put(&mut lt, &conn, &[0xAB; 169])
             .unwrap();
-        txn.commit().unwrap();
+        let pending = k_qr_pending(123, 0, 456);
+        reg.live_dbs()[LIVE_QR_PENDING]
+            .put(&mut lt, &pending, &v_qr_pending_encode(9, 10, 11))
+            .unwrap();
+        lt.commit().unwrap();
 
-        let txn = reg.read_txn().unwrap();
-        let got = reg.dbs[0].get(&txn, &conn).unwrap().unwrap();
+        // epoch 库写 RECORD_TS（历史索引 DBI）。
+        let mut et = reg.epoch_write_txn().unwrap();
+        reg.epoch_dbs()[EPOCH_RECORD_TS]
+            .put(&mut et, &k_record_ts(1, 2), &v_record_summary_encode(&RecordSummary::default()))
+            .unwrap();
+        et.commit().unwrap();
+
+        let lt = reg.live_read_txn().unwrap();
+        let got = reg.live_dbs()[LIVE_CONN_STATE].get(&lt, &conn).unwrap().unwrap();
         assert_eq!(got, &[0xAB; 169][..]);
-        let got = reg.dbs[2].get(&txn, &pending).unwrap().unwrap();
+        let got = reg.live_dbs()[LIVE_QR_PENDING].get(&lt, &pending).unwrap().unwrap();
         assert_eq!(v_qr_pending_decode(got).unwrap(), (9, 10, 11));
+        drop(lt);
+
+        let et = reg.epoch_read_txn().unwrap();
+        let got = reg.epoch_dbs()[EPOCH_RECORD_TS]
+            .get(&et, &k_record_ts(1, 2))
+            .unwrap()
+            .unwrap();
+        assert!(v_record_summary_decode(got).is_some());
+        drop(et);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn epoch_rotation_opens_next_and_reclaims() {
+        let dir = tmpdir("rotate");
+        let root = dir.join("qridx");
+        let mut reg = DbRegistry::open_with(&root, 10 * 1024 * 1024, 4 * 1024 * 1024).unwrap();
+        assert_eq!(reg.epoch_num(), 0);
+
+        let n = reg.rotate_epoch().unwrap();
+        assert_eq!(n, 1);
+        assert_eq!(reg.epoch_num(), 1);
+        assert!(root.join("epoch_0001/data.mdb").exists());
+        // 旧 epoch_0000 保持只读历史（可枚举）。
+        let dirs = reg.epoch_dirs();
+        assert_eq!(dirs.len(), 2);
+        assert_eq!(dirs[0].file_name().unwrap(), "epoch_0000");
+        assert_eq!(dirs[1].file_name().unwrap(), "epoch_0001");
+
+        // 历史 epoch 只读打开可枚举全部 DBI。
+        let (env, dbs) = open_epoch_read_only(&dirs[0], 10 * 1024 * 1024).unwrap();
+        assert_eq!(dbs.len(), NUM_EPOCH_DBIS);
+        drop(env);
+
+        // 重启恢复：open 复用最高 epoch。
+        drop(reg);
+        let reg2 = DbRegistry::open(&root, 10 * 1024 * 1024).unwrap();
+        assert_eq!(reg2.epoch_num(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn real_disk_size_tracks_epoch() {
+        let dir = tmpdir("rds");
+        let reg = DbRegistry::open(&dir, 10 * 1024 * 1024).unwrap();
+        // 空 epoch：real_disk_size 应 > 0（LMDB 元数据页）且 < map_size。
+        let sz = reg.real_disk_size().unwrap();
+        assert!(sz > 0 && sz < 10 * 1024 * 1024);
+        assert!(!reg.epoch_should_rotate().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 轮转后旧 epoch 只读重开（QuerySession 同款路径）：先 RW 打开写入 → 轮转丢弃 →
+    /// 再重开历史 epoch 必须成功。
+    #[test]
+    fn historical_epoch_readonly_reopen_after_rotation() {
+        let dir = tmpdir("histro");
+        let root = dir.join("qridx");
+        let reg = DbRegistry::open(&root, 10 * 1024 * 1024).unwrap();
+
+        // 往 epoch_0000 写点数据（模拟已归档历史）。
+        {
+            let mut et = reg.epoch_write_txn().unwrap();
+            reg.epoch_dbs()[EPOCH_RECORD_TS]
+                .put(&mut et, &k_record_ts(1, 2), &v_record_summary_encode(&RecordSummary::default()))
+                .unwrap();
+            et.commit().unwrap();
+        }
+        let e0 = root.join("epoch_0000");
+        drop(reg);
+
+        // 完全关闭后重开历史 epoch_0000（不轮转、纯关闭重开）。QuerySession 同款：
+        // env → static txn → 同 txn 内打开 DBI → get。
+        let env = open_epoch_env_read_only(&e0, 10 * 1024 * 1024)
+            .map_err(|e| anyhow::anyhow!("open fail: {e}"))
+            .unwrap();
+        let txn = env
+            .clone()
+            .static_read_txn()
+            .map_err(|e| anyhow::anyhow!("rtxn fail: {e}"))
+            .unwrap();
+        let dbs = open_epoch_dbs_in_txn(&env, &txn)
+            .map_err(|e| anyhow::anyhow!("dbi fail: {e}"))
+            .unwrap();
+        let got = dbs[EPOCH_RECORD_TS]
+            .get(&txn, &k_record_ts(1, 2))
+            .map_err(|e| anyhow::anyhow!("get fail: {e}"))
+            .unwrap()
+            .unwrap();
+        assert!(v_record_summary_decode(got).is_some());
+        drop(txn);
+        drop(env);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

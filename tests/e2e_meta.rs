@@ -12,7 +12,7 @@ use sov_vault::batch::{IndexedRecord, commit_batch_with_meta};
 use sov_vault::config::MetaBind;
 use sov_vault::connection::{ConnState, conn_hash};
 use sov_vault::db::{
-    DbRegistry, QrPairValue, QrStatus, IDX_CONN_STATE, IDX_QR_PAIR, k_conn_state, k_qr_pair,
+    DbRegistry, QrPairValue, QrStatus, LIVE_CONN_STATE, k_conn_state, k_qr_pair,
 };
 use sov_vault::ledger::{FileKind, Ledger};
 use sov_vault::meta::MetaRegistry;
@@ -149,8 +149,8 @@ fn commit_meta(
 }
 
 fn conn_state(ctx: &BatchCtx, h: u64) -> ConnState {
-    let txn = ctx.reg.read_txn().unwrap();
-    let v = ctx.reg.dbs[IDX_CONN_STATE]
+    let txn = ctx.reg.live_read_txn().unwrap();
+    let v = ctx.reg.live_dbs()[LIVE_CONN_STATE]
         .get(&txn, &k_conn_state(h))
         .unwrap()
         .unwrap();
@@ -158,8 +158,8 @@ fn conn_state(ctx: &BatchCtx, h: u64) -> ConnState {
 }
 
 fn pair_at(ctx: &BatchCtx, q_first_idx: u64) -> QrPairValue {
-    let txn = ctx.reg.read_txn().unwrap();
-    let v = ctx.reg.dbs[IDX_QR_PAIR]
+    let txn = ctx.reg.epoch_read_txn().unwrap();
+    let v = ctx.reg.epoch_dbs()[sov_vault::db::EPOCH_QR_PAIR]
         .get(&txn, &k_qr_pair(q_first_idx))
         .unwrap()
         .unwrap();

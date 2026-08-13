@@ -265,8 +265,9 @@ fn cmd_serve(cfg: &Config) -> Result<()> {
 
     let ledger = Ledger::open(&cfg.ledger_path())?;
     let map_size = cfg.lmdb_map_size_bytes()? as usize;
-    let reg = DbRegistry::open(&cfg.lmdb_dir(), map_size)?;
-    let env_stat = reg.env().stat();
+    let epoch_max_bytes = cfg.epoch_max_bytes()?;
+    let reg = DbRegistry::open_with(&cfg.lmdb_dir(), map_size, epoch_max_bytes)?;
+    let env_stat = reg.epoch_env().stat();
 
     tracing::info!("sovVault 三平面就绪（离线骨架，无在线端点）");
     tracing::info!(
@@ -275,9 +276,10 @@ fn cmd_serve(cfg: &Config) -> Result<()> {
         cfg.warm_dir().display()
     );
     tracing::info!(
-        "  索引平面: {} (map_size={}, DBI=9, 数据项={})",
+        "  索引平面: {} (map_size={}, live+epoch_00{:02}, 当前 epoch 数据项={})",
         cfg.lmdb_dir().display(),
         map_size,
+        reg.epoch_num(),
         env_stat.entries
     );
     tracing::info!(
@@ -315,7 +317,11 @@ fn cmd_serve(cfg: &Config) -> Result<()> {
 
 /// P3.5：RECORD_TS 时间窗报文查询（JSONL 输出）。
 fn cmd_query(cfg: &Config, start: Option<u64>, end: Option<u64>, limit: usize) -> Result<()> {
-    let reg = DbRegistry::open(&cfg.lmdb_dir(), cfg.lmdb_map_size_bytes()? as usize)?;
+    let reg = DbRegistry::open_with(
+        &cfg.lmdb_dir(),
+        cfg.lmdb_map_size_bytes()? as usize,
+        cfg.epoch_max_bytes()?,
+    )?;
     let s = QuerySession::open(&reg)?;
     let f = RecordFilter {
         start_ts: start,
@@ -349,7 +355,11 @@ fn cmd_qr(
     limit: usize,
     detail: bool,
 ) -> Result<()> {
-    let reg = DbRegistry::open(&cfg.lmdb_dir(), cfg.lmdb_map_size_bytes()? as usize)?;
+    let reg = DbRegistry::open_with(
+        &cfg.lmdb_dir(),
+        cfg.lmdb_map_size_bytes()? as usize,
+        cfg.epoch_max_bytes()?,
+    )?;
     let s = QuerySession::open(&reg)?;
     let status = match status {
         Some(raw) => Some(
@@ -461,7 +471,11 @@ fn cmd_export(
     flags: Option<String>,
     output: &std::path::Path,
 ) -> Result<()> {
-    let reg = DbRegistry::open(&cfg.lmdb_dir(), cfg.lmdb_map_size_bytes()? as usize)?;
+    let reg = DbRegistry::open_with(
+        &cfg.lmdb_dir(),
+        cfg.lmdb_map_size_bytes()? as usize,
+        cfg.epoch_max_bytes()?,
+    )?;
     let ledger = Ledger::open(&cfg.ledger_path())?;
     let (flags_all, flags_any) = match flags {
         Some(raw) => {

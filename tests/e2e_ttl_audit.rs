@@ -78,7 +78,6 @@ fn e2e_ingest_ttl_audit_query_loop() {
     let now = now_ns();
     // 灌库：握手 + 一条过期未响应 Q（q_ts = now - 40s > qr_timeout 30s）。
     let mut pipe = BatchPipeline::new(
-        &reg,
         &ledger,
         dir.join("hot"),
         1,
@@ -95,9 +94,9 @@ fn e2e_ingest_ttl_audit_query_loop() {
         pkt(CIP, SIP, CPORT, SPORT, TCP_ACK, now - 40 * SEC, 1001, 5001, b"GET /stale"),
     ];
     for r in recs {
-        pipe.push_record(r).unwrap();
+        pipe.push_record(&reg, r).unwrap();
     }
-    pipe.finish().unwrap();
+    pipe.finish(&reg).unwrap();
 
     // P4：TTL 扫描（后台协程同款逻辑）+ 终态事件落 SQLite 台账。
     let (events, stats) = scan_pending_ttl(&reg, now, 30, 5).unwrap();

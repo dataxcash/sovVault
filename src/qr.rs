@@ -1,27 +1,40 @@
 //! P3 QR 匹配引擎：绝对序列流翻译器 + 累积 ACK 消费 + 快/慢路径缝合 + 代际（incarnation）隔离。
 //!
-//! 设计依据：08 §4.0/§5.1/§5.2/§5.4 + v0.5 代际规格（评审确认：代际整数匹配是封死幽灵包污染的唯一物理屏障）。
+//! 设计依据：08 §4.0/§5.1/§5.2/§5.4 + 09 §13（双库分库轮转）+ v0.5 代际规格。
 //!
 //! 关键决策：
 //! - `SeqStream`：raw(u32)→abs(u64) 非回退翻译器；前向推进、重叠/重传不倒退（DUP 检测）。
-//!   每方向 `last_raw`/`abs_seq`/激活位持久化进 DBI_CONN_STATE（08 §4.1 规格补全）——
-//!   跨批/跨文件慢路径重载翻译器时 wrap 仍正确，且不会把"恢复的基线"误判为裸跳变。
+//!   每方向 `last_raw`/`abs_seq`/激活位持久化进 DBI_CONN_STATE（08 §4.1）——跨批/跨文件慢路径
+//!   重载翻译器时 wrap 仍正确。
 //! - incarnation:u16 升格为 DBI_QR_PENDING 的 Key 物理前缀 `[conn][incarnation][abs_q_end]`：
 //!   旧代际挂起 Q 在 B+ 树存储层被物理隔离，幽灵包（旧连接迟到 ACK/RST）游标根本读不到。
-//! - 代际边界（异窗 SYN / 未信号裸跳变 |d|>2^30）：同一 RW_TXN 内原子完成
-//!   代际 +1 + 双向翻译器重置 + 旧代际 PENDING 批量翻转 `UNMATCHED` + pending/TTL 清除 + 审计。
-//! - RST 级联：当前代际 PENDING → `RST_ABORT`（08 §5.4），不留到超时。
-//! - 幂等：Q 打开全部走 MDB_NOOVERWRITE（确定性 q_first_idx）；终态翻转/删除幂等，
-//!   与 P2 的 2PC-Lite 重放收敛完全兼容（"零脏数据、零翻倍"不破）。
+//!
+//! ## 双库事务模型（09 §13.3/13.4）★
+//!
+//! QrMatcher 持有 **两个写事务**（live_txn + epoch_txn），DBI 归属见 db.rs 模块注释：
+//! - **live_txn**：CONN_STATE / QR_PENDING / PENDING_TTL / 在途 QR_PAIR(PENDING)；
+//! - **epoch_txn**：终态 QR_PAIR / CONN_QR / QR_KEY / QR_TIME / PACKET_QR / RECORD_TS。
+//!
+//! **QR_PAIR 在途→终态迁移**：Q 打开写 live(PENDING)；R 消费 / TTL 超时 / RST 级联 / 代际翻转 /
+//! 检疫进入终态时，`migrate_terminal` 执行「读 live → 翻转终态 → 写 epoch（NO_OVERWRITE）→ 删 live」。
+//! **迁移幂等（§13.4.2）**：先查 epoch → 已有终态则跳过迁移（不重复写）、仅清理 live 残留；不存在才迁移。
+//!
+//! **提交顺序（epoch 先行）**：epoch_txn.commit() → live_txn.commit()。理由见 db.rs 模块注释——
+//! §13.4.2 幂等表要求「写 epoch 后、删 live 前」窗口内重放收敛，live 残留删除与 CONN_STATE 在同一
+//! live txn 原子提交，故 epoch 必须先持久。
+//!
+//! **次级索引 status 去重（§13.4.1）**：CONN_QR / QR_KEY / QR_TIME 不再存 status，Q 打开时写一次
+//! （value = q_first_idx，纯定位索引）、永不更新——消除跨 epoch 更新矛盾，历史库回归「追加后只读」。
+//! status 过滤查询改为「索引定位候选 → QR_PAIR 主行现查」（见 query.rs）。
 
 use crate::batch::IndexedRecord;
 use crate::connection::{anomaly, conn_hash, ConnState, ConnStateKind};
 use crate::db::{
     put_no_overwrite, v_pending_ttl_encode, v_qr_pending_decode, v_qr_pending_encode,
-    v_record_summary_encode, v_status_encode, DbRegistry, QrPairValue, QrStatus, RecordSummary,
-    IDX_CONN_QR, IDX_CONN_STATE, IDX_PACKET_QR, IDX_PENDING_TTL, IDX_QR_KEY, IDX_QR_PAIR,
-    IDX_QR_PENDING, IDX_QR_TIME, IDX_RECORD_TS, NUM_DBIS, k_conn_qr, k_conn_state, k_packet_qr,
-    k_pending_ttl, k_qr_key, k_qr_pair, k_qr_pending, k_qr_pending_prefix, k_qr_time,
+    v_record_summary_encode, v_secondary_encode, DbRegistry, QrPairValue, QrStatus, RecordSummary,
+    EPOCH_CONN_QR, EPOCH_PACKET_QR, EPOCH_QR_KEY, EPOCH_QR_PAIR, EPOCH_QR_TIME, EPOCH_RECORD_TS,
+    LIVE_CONN_STATE, LIVE_PENDING_TTL, LIVE_QR_PAIR, LIVE_QR_PENDING, k_conn_qr, k_conn_state,
+    k_packet_qr, k_pending_ttl, k_qr_key, k_qr_pair, k_qr_pending, k_qr_pending_prefix, k_qr_time,
     k_record_ts,
 };
 use crate::ledger::AnomalyEvent;
@@ -196,10 +209,12 @@ struct PendingHit {
     q_ts: u64,
 }
 
-/// P3 匹配引擎：一个 LMDB RW_TXN = 一个 Batch（P2 2PC-Lite 第一步，原子不破）。
+/// P3 匹配引擎：一个 Batch = 双 env 双写事务（09 §13.4，epoch 先行提交）。
 pub struct QrMatcher<'e> {
-    dbs: [Database<Bytes, Bytes>; NUM_DBIS],
-    txn: heed::RwTxn<'e>,
+    live_dbs: [Database<Bytes, Bytes>; crate::db::NUM_LIVE_DBIS],
+    epoch_dbs: [Database<Bytes, Bytes>; crate::db::NUM_EPOCH_DBIS],
+    live_txn: heed::RwTxn<'e>,
+    epoch_txn: heed::RwTxn<'e>,
     ack_tol: u32,
     /// 批内连接热状态缓存（load-modify-write，同 txn，杜绝内存/LMDB 双态漂移）。
     conns: HashMap<u64, ConnRt>,
@@ -211,7 +226,7 @@ pub struct QrMatcher<'e> {
 }
 
 impl<'e> QrMatcher<'e> {
-    pub fn begin<'a>(reg: &'a DbRegistry, params: &QrParams) -> Result<QrMatcher<'a>> {
+    pub fn begin(reg: &'e DbRegistry, params: &QrParams) -> Result<QrMatcher<'e>> {
         QrMatcher::begin_with_meta(reg, params, None)
     }
 
@@ -221,10 +236,13 @@ impl<'e> QrMatcher<'e> {
         params: &QrParams,
         meta: Option<&'a MetaRegistry>,
     ) -> Result<QrMatcher<'a>> {
-        let txn = reg.write_txn()?;
+        let live_txn = reg.live_write_txn()?;
+        let epoch_txn = reg.epoch_write_txn()?;
         Ok(QrMatcher {
-            dbs: reg.dbs,
-            txn,
+            live_dbs: *reg.live_dbs(),
+            epoch_dbs: *reg.epoch_dbs(),
+            live_txn,
+            epoch_txn,
             ack_tol: params.ack_tolerance,
             conns: HashMap::new(),
             anomalies: Vec::new(),
@@ -233,10 +251,11 @@ impl<'e> QrMatcher<'e> {
         })
     }
 
-    /// 提交：写回全部连接热状态 → 提交 txn → 返回审计事件（由调用方落 SQLite）。
+    /// 提交：写回全部连接热状态（live）→ epoch 先行 → live 殿后 → 返回审计事件（调用方落 SQLite）。
     pub fn commit(mut self) -> Result<Vec<AnomalyEvent>> {
         self.writeback_conns()?;
-        self.txn.commit()?;
+        self.epoch_txn.commit()?;
+        self.live_txn.commit()?;
         Ok(self.anomalies)
     }
 
@@ -245,14 +264,14 @@ impl<'e> QrMatcher<'e> {
         &self.ext_meta
     }
 
-    /// 处理一条报文：RECORD_TS 确定性索引（P2）+ 连接状态机 + QR 匹配（P3），同一 txn。
+    /// 处理一条报文：RECORD_TS 确定性索引（epoch，P2）+ 连接状态机 + QR 匹配（P3），双 txn。
     pub fn ingest(&mut self, r: &IndexedRecord) -> Result<()> {
-        // P2 兼容：RECORD_TS 逐条确定性索引（NO_OVERWRITE 幂等，重放收敛依据）。
+        // P2 兼容：RECORD_TS 逐条确定性索引（epoch，NO_OVERWRITE 幂等，重放收敛依据）。
         {
-            let db = self.dbs[IDX_RECORD_TS];
+            let db = self.epoch_dbs[EPOCH_RECORD_TS];
             let key = k_record_ts(r.rec.timestamp_ns, r.idx());
             let val = v_record_summary_encode(&RecordSummary::from(&r.rec));
-            put_no_overwrite(&db, &mut self.txn, &key, &val)?;
+            put_no_overwrite(&db, &mut self.epoch_txn, &key, &val)?;
         }
 
         let rec = &r.rec;
@@ -407,13 +426,13 @@ impl<'e> QrMatcher<'e> {
         Ok((h_f, Dir::C2S))
     }
 
-    /// 缓存/LMDB 加载连接热状态（存在返回 true）。
+    /// 缓存/LMDB 加载连接热状态（live 库，存在返回 true）。
     fn load_conn(&mut self, h: u64) -> Result<bool> {
         if self.conns.contains_key(&h) {
             return Ok(true);
         }
-        let db = self.dbs[IDX_CONN_STATE];
-        let got = db.get(&self.txn, &k_conn_state(h))?;
+        let db = self.live_dbs[LIVE_CONN_STATE];
+        let got = db.get(&self.live_txn, &k_conn_state(h))?;
         if let Some(v) = got {
             if let Some(st) = ConnState::from_bytes(v) {
                 self.conns.insert(h, ConnRt { state: st });
@@ -423,7 +442,8 @@ impl<'e> QrMatcher<'e> {
         Ok(false)
     }
 
-    /// Q 打开：PENDING QRPAIR + 全部索引，一次写齐（NO_OVERWRITE 幂等）。
+    /// Q 打开：PENDING QRPAIR → live；次级索引（CONN_QR/QR_KEY/QR_TIME/PACKET_QR）→ epoch 纯追加。
+    /// 次级索引 value 不存 status（§13.4.1），Q 打开写一次、永不更新。
     fn open_q(
         &mut self,
         h: u64,
@@ -478,43 +498,70 @@ impl<'e> QrMatcher<'e> {
         };
         let inc = st.incarnation;
 
-        let dbp = self.dbs[IDX_QR_PAIR];
-        put_no_overwrite(&dbp, &mut self.txn, &k_qr_pair(q_first_idx), &pair.encode())?;
+        // live：在途 QR_PAIR(PENDING) + QR_PENDING + PENDING_TTL。
+        let dbp = self.live_dbs[LIVE_QR_PAIR];
+        put_no_overwrite(
+            &dbp,
+            &mut self.live_txn,
+            &k_qr_pair(q_first_idx),
+            &pair.encode(),
+        )?;
 
-        let dpp = self.dbs[IDX_QR_PENDING];
+        let dpp = self.live_dbs[LIVE_QR_PENDING];
         put_no_overwrite(
             &dpp,
-            &mut self.txn,
+            &mut self.live_txn,
             &k_qr_pending(h, inc, abs_end),
             &v_qr_pending_encode(q_first_idx, pair.q_ts, pair.q_len),
         )?;
 
-        let dtt = self.dbs[IDX_PENDING_TTL];
+        let dtt = self.live_dbs[LIVE_PENDING_TTL];
         put_no_overwrite(
             &dtt,
-            &mut self.txn,
+            &mut self.live_txn,
             &k_pending_ttl(pair.q_ts, h),
             &v_pending_ttl_encode(q_first_idx, abs_end),
         )?;
 
-        let dpq = self.dbs[IDX_PACKET_QR];
-        put_no_overwrite(&dpq, &mut self.txn, &k_packet_qr(q_first_idx), &q_first_idx.to_be_bytes())?;
+        // epoch：次级索引纯追加（§13.4.1，value=q_first_idx 定位，无 status）。
+        let dpq = self.epoch_dbs[EPOCH_PACKET_QR];
+        put_no_overwrite(
+            &dpq,
+            &mut self.epoch_txn,
+            &k_packet_qr(q_first_idx),
+            &v_packet_qr_enc(q_first_idx),
+        )?;
 
         let kh = crate::connection::fnv1a64(&pair.req_key);
-        let status = v_status_encode(QrStatus::Pending);
-        let dcq = self.dbs[IDX_CONN_QR];
-        put_no_overwrite(&dcq, &mut self.txn, &k_conn_qr(h, pair.q_ts, q_first_idx), &status)?;
-        let dqk = self.dbs[IDX_QR_KEY];
-        put_no_overwrite(&dqk, &mut self.txn, &k_qr_key(kh, pair.q_ts, q_first_idx), &status)?;
-        let dqt = self.dbs[IDX_QR_TIME];
-        put_no_overwrite(&dqt, &mut self.txn, &k_qr_time(pair.q_ts, q_first_idx), &status)?;
+        let sec = v_secondary_encode(q_first_idx);
+        let dcq = self.epoch_dbs[EPOCH_CONN_QR];
+        put_no_overwrite(
+            &dcq,
+            &mut self.epoch_txn,
+            &k_conn_qr(h, pair.q_ts, q_first_idx),
+            &sec,
+        )?;
+        let dqk = self.epoch_dbs[EPOCH_QR_KEY];
+        put_no_overwrite(
+            &dqk,
+            &mut self.epoch_txn,
+            &k_qr_key(kh, pair.q_ts, q_first_idx),
+            &sec,
+        )?;
+        let dqt = self.epoch_dbs[EPOCH_QR_TIME];
+        put_no_overwrite(
+            &dqt,
+            &mut self.epoch_txn,
+            &k_qr_time(pair.q_ts, q_first_idx),
+            &sec,
+        )?;
 
         st.req_cnt += 1;
         st.qr_open += 1;
         Ok(())
     }
 
-    /// R 累积 ACK 消费：范围扫描 [conn][inc][0..=abs_ack+tol]，命中翻转 MATCHED；
+    /// R 累积 ACK 消费：范围扫描 [conn][inc][0..=abs_ack+tol]，命中翻转 MATCHED 并迁移到 epoch；
     /// 批量 ACK 命中多个 Q → 聚合进首个 QRPAIR 的 q_idx_list（重放不重复注入同一响应）。
     fn consume_r(
         &mut self,
@@ -532,46 +579,46 @@ impl<'e> QrMatcher<'e> {
         }
 
         for (i, hit) in hits.iter().enumerate() {
-            let dbp = self.dbs[IDX_QR_PAIR];
-            let kp = k_qr_pair(hit.q_first_idx);
-            let Some(v) = dbp.get(&self.txn, &kp)? else { continue };
-            let Some(mut pair) = QrPairValue::decode(v) else { continue };
-            if pair.status != QrStatus::Pending as u8 {
-                continue; // 已终态（幂等重放）。
-            }
-            pair.status = QrStatus::Matched as u8;
-            pair.r_ts = r.rec.timestamp_ns;
-            pair.latency_ms = pair.r_ts.saturating_sub(pair.q_ts) / 1_000_000;
-            pair.r_len = pair.r_len.saturating_add(r.rec.orig_payload_len);
-            pair.r_idx.push(r.idx());
-            if i == 0 {
-                // 批量 ACK 聚合：后续挂起 Q 并入 primary 的 q_idx_list。
-                pair.resp_key = req_key_of(&r.rec);
-                for other in hits.iter().skip(1) {
-                    if !pair.q_idx.contains(&other.q_first_idx) {
-                        pair.q_idx.push(other.q_first_idx);
+            let primary = i == 0;
+            let migrated = self.migrate_terminal(hit.q_first_idx, |pair| {
+                pair.status = QrStatus::Matched as u8;
+                pair.r_ts = r.rec.timestamp_ns;
+                pair.latency_ms = pair.r_ts.saturating_sub(pair.q_ts) / 1_000_000;
+                pair.r_len = pair.r_len.saturating_add(r.rec.orig_payload_len);
+                pair.r_idx.push(r.idx());
+                if primary {
+                    // 批量 ACK 聚合：后续挂起 Q 并入 primary 的 q_idx_list。
+                    pair.resp_key = req_key_of(&r.rec);
+                    for other in hits.iter().skip(1) {
+                        if !pair.q_idx.contains(&other.q_first_idx) {
+                            pair.q_idx.push(other.q_first_idx);
+                        }
                     }
                 }
-            }
-            dbp.put(&mut self.txn, &kp, &pair.encode())?;
-            self.sync_secondary_status(&pair, hit.q_first_idx, QrStatus::Matched)?;
+            })?;
 
-            let dpp = self.dbs[IDX_QR_PENDING];
-            dpp.delete(&mut self.txn, &hit.key)?;
-            let dtt = self.dbs[IDX_PENDING_TTL];
-            dtt.delete(&mut self.txn, &k_pending_ttl(pair.q_ts, h))?;
-            st.qr_open = st.qr_open.saturating_sub(1);
+            // live 残留清理（幂等）：QR_PENDING + PENDING_TTL。
+            let dpp = self.live_dbs[LIVE_QR_PENDING];
+            dpp.delete(&mut self.live_txn, &hit.key)?;
+            let dtt = self.live_dbs[LIVE_PENDING_TTL];
+            dtt.delete(&mut self.live_txn, &k_pending_ttl(hit.q_ts, h))?;
+            // 实际迁移（非重放跳过）才递减 qr_open；writeback 时按 live QR_PENDING 计数兜底校准。
+            if migrated {
+                st.qr_open = st.qr_open.saturating_sub(1);
+            }
         }
         st.consumed_ack_s = abs_ack.max(st.consumed_ack_s);
         Ok(())
     }
 
-    /// 代际边界原子切换：旧代际 PENDING → UNMATCHED + 清理；代际 +1；双向翻译器重置。
+    /// 代际边界原子切换：旧代际 PENDING → UNMATCHED（迁移到 epoch）+ 清理；代际 +1；双向翻译器重置。
     fn flip_epoch(&mut self, h: u64, rec: &WalRecord, dir: Dir, syn_idx: u64) -> Result<()> {
         let old_inc = self.conns.get(&h).unwrap().state.incarnation;
         let hits = self.scan_pending_upto(h, old_inc, U48_MAX)?;
         for hit in &hits {
-            self.flip_pair_status(hit.q_first_idx, QrStatus::Unmatched)?;
+            self.migrate_terminal(hit.q_first_idx, |pair| {
+                pair.status = QrStatus::Unmatched as u8;
+            })?;
             // P4：终态事件逐 Q 串接审计台账（可回跳原文，不丢失基因锚）。
             self.anomalies.push(AnomalyEvent {
                 ts: rec.timestamp_ns as i64,
@@ -582,10 +629,10 @@ impl<'e> QrMatcher<'e> {
                 qr_id: Some(hit.q_first_idx as i64),
                 detail: Some(format!("epoch={} gen_flip", old_inc)),
             });
-            let dpp = self.dbs[IDX_QR_PENDING];
-            dpp.delete(&mut self.txn, &hit.key)?;
-            let dtt = self.dbs[IDX_PENDING_TTL];
-            dtt.delete(&mut self.txn, &k_pending_ttl(hit.q_ts, h))?;
+            let dpp = self.live_dbs[LIVE_QR_PENDING];
+            dpp.delete(&mut self.live_txn, &hit.key)?;
+            let dtt = self.live_dbs[LIVE_PENDING_TTL];
+            dtt.delete(&mut self.live_txn, &k_pending_ttl(hit.q_ts, h))?;
         }
 
         let st = &mut self.conns.get_mut(&h).unwrap().state;
@@ -636,12 +683,14 @@ impl<'e> QrMatcher<'e> {
         Ok(())
     }
 
-    /// RST 级联：当前代际全部 PENDING → RST_ABORT（08 §5.4，不留超时）。
+    /// RST 级联：当前代际全部 PENDING → RST_ABORT（迁移到 epoch，08 §5.4，不留超时）。
     fn rst_cascade(&mut self, h: u64, st: &mut ConnState, rec: &WalRecord) -> Result<()> {
         let inc = st.incarnation;
         let hits = self.scan_pending_upto(h, inc, U48_MAX)?;
         for hit in &hits {
-            self.flip_pair_status(hit.q_first_idx, QrStatus::RstAbort)?;
+            self.migrate_terminal(hit.q_first_idx, |pair| {
+                pair.status = QrStatus::RstAbort as u8;
+            })?;
             // P4：终态事件逐 Q 串接审计台账。
             self.anomalies.push(AnomalyEvent {
                 ts: rec.timestamp_ns as i64,
@@ -652,10 +701,10 @@ impl<'e> QrMatcher<'e> {
                 qr_id: Some(hit.q_first_idx as i64),
                 detail: Some(format!("inc={} rst_cascade", inc)),
             });
-            let dpp = self.dbs[IDX_QR_PENDING];
-            dpp.delete(&mut self.txn, &hit.key)?;
-            let dtt = self.dbs[IDX_PENDING_TTL];
-            dtt.delete(&mut self.txn, &k_pending_ttl(hit.q_ts, h))?;
+            let dpp = self.live_dbs[LIVE_QR_PENDING];
+            dpp.delete(&mut self.live_txn, &hit.key)?;
+            let dtt = self.live_dbs[LIVE_PENDING_TTL];
+            dtt.delete(&mut self.live_txn, &k_pending_ttl(hit.q_ts, h))?;
         }
         st.qr_open = st.qr_open.saturating_sub(hits.len() as u64);
         self.anomalies.push(AnomalyEvent {
@@ -670,39 +719,67 @@ impl<'e> QrMatcher<'e> {
         Ok(())
     }
 
-    /// QRPAIR 主键状态翻转（读改写，保留基因锚 Q_IDX/Req_KEY）+ 次级索引同步。
-    fn flip_pair_status(&mut self, q_first_idx: u64, status: QrStatus) -> Result<()> {
-        let dbp = self.dbs[IDX_QR_PAIR];
+    /// QR_PAIR 在途→终态迁移（09 §13.4.2 幂等规则，五条终态路径统一实现）：
+    ///
+    /// ```text
+    /// 崩溃窗口                 重放时的状态              重放动作
+    /// ─────────────────────────────────────────────────────────────────
+    /// 迁移前崩溃              live 有 PENDING            正常迁移
+    /// 写 epoch 后、删 live 前  live 有 PENDING           先查 epoch：已有 → 跳过迁移（幂等）
+    ///                          epoch 已有终态            再删 live 残留
+    /// 删 live 后、水位线前       live 无、epoch 有终态     已收敛，水位线推进即完成
+    /// ```
+    ///
+    /// - 先查 epoch：已有终态 → 跳过迁移（不重复写），返回 false；
+    /// - 不存在 → 读 live(PENDING) → `flip` 变更终态字段 → 写 epoch（NO_OVERWRITE）→ 删 live，返回 true。
+    fn migrate_terminal<F>(&mut self, q_first_idx: u64, flip: F) -> Result<bool>
+    where
+        F: FnOnce(&mut QrPairValue),
+    {
         let kp = k_qr_pair(q_first_idx);
-        let Some(v) = dbp.get(&self.txn, &kp)? else { return Ok(()) };
-        let Some(mut pair) = QrPairValue::decode(v) else { return Ok(()) };
-        if pair.status == status as u8 {
-            return Ok(()); // 幂等。
+
+        // ① 幂等判定：先查 epoch（历史库追加后只读，已有终态则不再写）。
+        if self.epoch_dbs[EPOCH_QR_PAIR]
+            .get(&self.epoch_txn, &kp)?
+            .is_some()
+        {
+            // 仅清理 live 残留（幂等）。
+            self.live_dbs[LIVE_QR_PAIR].delete(&mut self.live_txn, &kp)?;
+            return Ok(false);
         }
-        pair.status = status as u8;
-        dbp.put(&mut self.txn, &kp, &pair.encode())?;
-        self.sync_secondary_status(&pair, q_first_idx, status)?;
-        Ok(())
+
+        // ② 读 live(PENDING)。
+        let Some(v) = self.live_dbs[LIVE_QR_PAIR].get(&self.live_txn, &kp)? else {
+            return Ok(false); // 主键缺失（幂等）。
+        };
+        let Some(mut pair) = QrPairValue::decode(v) else {
+            return Ok(false);
+        };
+        if pair.status != QrStatus::Pending as u8 {
+            return Ok(false); // 已终态（幂等重放）。
+        }
+
+        flip(&mut pair);
+
+        // ③ 写 epoch（NO_OVERWRITE 幂等）+ ④ 删 live。
+        put_no_overwrite(
+            &self.epoch_dbs[EPOCH_QR_PAIR],
+            &mut self.epoch_txn,
+            &kp,
+            &pair.encode(),
+        )?;
+        self.live_dbs[LIVE_QR_PAIR].delete(&mut self.live_txn, &kp)?;
+        Ok(true)
     }
 
-    /// 次级索引（CONN_QR / QR_KEY / QR_TIME）状态同步（同 txn，软缓存一致）。
-    fn sync_secondary_status(
-        &mut self,
-        pair: &QrPairValue,
-        q_first_idx: u64,
-        status: QrStatus,
-    ) -> Result<()> {
-        write_secondary_status(&self.dbs, &mut self.txn, pair, q_first_idx, status)
-    }
-
-    /// 范围扫描 [conn][inc] 前缀下 abs_q_end ≤ limit 的全部 PENDING。
+    /// 范围扫描 live QR_PENDING：[conn][inc] 前缀下 abs_q_end ≤ limit 的全部 PENDING。
     fn scan_pending_upto(&self, h: u64, inc: u16, abs_limit: u64) -> Result<Vec<PendingHit>> {
-        let db = self.dbs[IDX_QR_PENDING];
+        let db = self.live_dbs[LIVE_QR_PENDING];
         let lo = k_qr_pending_prefix(h, inc);
         let hi = k_qr_pending(h, inc, abs_limit.min(U48_MAX));
         let mut out = Vec::new();
         let range = (Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice()));
-        let rng = db.range(&self.txn, &range)?;
+        let rng = db.range(&self.live_txn, &range)?;
         for item in rng {
             let (k, v) = item?;
             if let Some((q_first_idx, q_ts, _)) = v_qr_pending_decode(v) {
@@ -720,15 +797,31 @@ impl<'e> QrMatcher<'e> {
         self.conns.get_mut(&h).unwrap().state = *st;
     }
 
+    /// 写回连接热状态（live 库）。qr_open 以「live QR_PENDING 行数」兜底校准：
+    /// 崩溃窗口下增量递减可能漂移，但 QR_PENDING 是"在途"的单一真源，重算即幂等收敛。
     fn writeback_conns(&mut self) -> Result<()> {
-        let db = self.dbs[IDX_CONN_STATE];
+        let db = self.live_dbs[LIVE_CONN_STATE];
         let mut keys: Vec<u64> = self.conns.keys().copied().collect();
         keys.sort_unstable();
         for h in keys {
-            let st = self.conns.get(&h).unwrap().state;
-            db.put(&mut self.txn, &k_conn_state(h), &st.to_bytes())?;
+            let mut st = self.conns.get(&h).unwrap().state;
+            st.qr_open = self.count_live_pending(h)?;
+            db.put(&mut self.live_txn, &k_conn_state(h), &st.to_bytes())?;
         }
         Ok(())
+    }
+
+    /// 统计某连接全部代际的 live QR_PENDING 行数（qr_open 真源）。
+    fn count_live_pending(&self, h: u64) -> Result<u64> {
+        let db = self.live_dbs[LIVE_QR_PENDING];
+        let mut lo = [0u8; 16];
+        lo[0..8].copy_from_slice(&h.to_be_bytes());
+        let mut hi = [0u8; 16];
+        hi[0..8].copy_from_slice(&h.to_be_bytes());
+        hi[8..].fill(0xFF);
+        let range = (Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice()));
+        let n = db.range(&self.live_txn, &range)?.count() as u64;
+        Ok(n)
     }
 }
 
@@ -738,28 +831,15 @@ fn req_key_of(rec: &WalRecord) -> Vec<u8> {
     rec.payload[..n].to_vec()
 }
 
-/// 次级索引状态写（CONN_QR / QR_KEY / QR_TIME，同 txn 软缓存一致）。
-/// 与 QrMatcher::ingest 同一事务内的 Q 翻转 / RST 级联 / 代际翻转 / P4 TTL 扫描共用，
-/// 保证三个状态索引与 QRPAIR 主行永不漂移。
-pub(crate) fn write_secondary_status(
-    dbs: &[Database<Bytes, Bytes>; NUM_DBIS],
-    txn: &mut heed::RwTxn<'_>,
-    pair: &QrPairValue,
-    q_first_idx: u64,
-    status: QrStatus,
-) -> Result<()> {
-    let kh = crate::connection::fnv1a64(&pair.req_key);
-    let s = v_status_encode(status);
-    dbs[IDX_CONN_QR].put(txn, &k_conn_qr(pair.conn_hash, pair.q_ts, q_first_idx), &s)?;
-    dbs[IDX_QR_KEY].put(txn, &k_qr_key(kh, pair.q_ts, q_first_idx), &s)?;
-    dbs[IDX_QR_TIME].put(txn, &k_qr_time(pair.q_ts, q_first_idx), &s)?;
-    Ok(())
+/// PACKET_QR value（q_first_idx 8B BE，与 §13.4.1 次级索引 value 语义一致）。
+fn v_packet_qr_enc(q_first_idx: u64) -> [u8; 8] {
+    q_first_idx.to_be_bytes()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::IDX_QR_PAIR;
+    use crate::db::LIVE_QR_PAIR;
     use sov_probe::wal::header::TCP_ACK;
     use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -834,14 +914,12 @@ mod tests {
     }
 
     fn pair_at(reg: &DbRegistry, q_first_idx: u64) -> Option<QrPairValue> {
-        let txn = reg.read_txn().unwrap();
-        let v = reg.dbs[IDX_QR_PAIR].get(&txn, &k_qr_pair(q_first_idx)).unwrap()?;
-        QrPairValue::decode(v)
+        reg.qr_pair_at(q_first_idx).unwrap()
     }
 
     fn pending_len(reg: &DbRegistry, h: u64, inc: u16) -> u64 {
-        let txn = reg.read_txn().unwrap();
-        let db = reg.dbs[IDX_QR_PENDING];
+        let txn = reg.live_read_txn().unwrap();
+        let db = reg.live_dbs()[LIVE_QR_PENDING];
         let lo = k_qr_pending_prefix(h, inc);
         let hi = k_qr_pending(h, inc, U48_MAX);
         let range = (Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice()));
@@ -849,14 +927,65 @@ mod tests {
     }
 
     fn conn_state_at(reg: &DbRegistry, h: u64) -> ConnState {
-        let txn = reg.read_txn().unwrap();
-        let v = reg.dbs[IDX_CONN_STATE].get(&txn, &k_conn_state(h)).unwrap().unwrap();
+        let txn = reg.live_read_txn().unwrap();
+        let v = reg.live_dbs()[LIVE_CONN_STATE]
+            .get(&txn, &k_conn_state(h))
+            .unwrap()
+            .unwrap();
         ConnState::from_bytes(v).unwrap()
     }
 
     fn qr_pair_count(reg: &DbRegistry) -> u64 {
-        let txn = reg.read_txn().unwrap();
-        reg.dbs[IDX_QR_PAIR].len(&txn).unwrap()
+        reg.qr_pair_count().unwrap()
+    }
+
+    /// 终态 QR_PAIR 应迁移到 epoch 库（§13.3），live 库仅留在途 PENDING。
+    #[test]
+    fn terminal_migrates_to_epoch_and_live_holds_pending_only() {
+        let dir = tmpdir("migrate");
+        let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
+        let params = QrParams::default();
+        let mut o = Offset(0);
+        // 握手 + Q1（PENDING 留 live）。
+        let q = c2s(1001, 5001, b"GET /a");
+        let q_idx = (1u64 << 32) | o.next(&q) as u64;
+        run(
+            &reg,
+            &params,
+            &[
+                (pkt(CIP, SIP, CPORT, SPORT, TCP_SYN, 1000, 0, b""), o.next(&c2s(1000, 0, b""))),
+                (pkt(SIP, CIP, SPORT, CPORT, TCP_SYN | TCP_ACK, 5000, 1001, b""), o.next(&s2c(5000, 1001, b""))),
+                (q.clone(), q_idx as u32),
+            ],
+        );
+        // PENDING 在 live，epoch 无该行。
+        let lt = reg.live_read_txn().unwrap();
+        assert!(reg.live_dbs()[LIVE_QR_PAIR]
+            .get(&lt, &k_qr_pair(q_idx))
+            .unwrap()
+            .is_some());
+        drop(lt);
+        let et = reg.epoch_read_txn().unwrap();
+        assert!(reg.epoch_dbs()[EPOCH_QR_PAIR]
+            .get(&et, &k_qr_pair(q_idx))
+            .unwrap()
+            .is_none());
+        drop(et);
+
+        // R 消费 → 终态 MATCHED 迁移到 epoch；live 行已删。
+        let r = s2c(5001, 1007, b"200");
+        let r_idx = (1u64 << 32) | o.next(&r) as u64;
+        run(&reg, &params, &[(r, r_idx as u32)]);
+        let lt = reg.live_read_txn().unwrap();
+        assert!(reg.live_dbs()[LIVE_QR_PAIR]
+            .get(&lt, &k_qr_pair(q_idx))
+            .unwrap()
+            .is_none());
+        drop(lt);
+        let p = pair_at(&reg, q_idx).unwrap();
+        assert_eq!(p.status, QrStatus::Matched as u8);
+        assert_eq!(p.r_idx, vec![r_idx]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -897,7 +1026,6 @@ mod tests {
             (c2s(1001, 5001, b"GET /a"), o.next(&c2s(1001, 5001, b"GET /a"))),
             (s2c(5001, 1011, b"HTTP/1.1 200"), o.next(&s2c(5001, 1011, b"HTTP/1.1 200"))),
         ];
-        // 修正：第三条 ACK 记录 seq=1001 ack=5001（此处 recs[2] 已正确）
         let q_idx = recs[3].1 as u64 | (1u64 << 32);
         let r_idx = recs[4].1 as u64 | (1u64 << 32);
         run(&reg, &params, &recs);
@@ -958,7 +1086,7 @@ mod tests {
         let dir = tmpdir("slow");
         let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
         let params = QrParams::default();
-        // 批 1：握手 + Q（Q 落 PENDING，跨批待消费）
+        // 批 1：握手 + Q（Q 落 PENDING live，跨批待消费）
         let mut o = Offset(0);
         let q_rec = c2s(1001, 5001, b"GET /slow");
         let q_idx = (1u64 << 32) | o.next(&q_rec) as u64;
@@ -1049,7 +1177,7 @@ mod tests {
             &params,
             &[(pkt(CIP, SIP, CPORT, SPORT, TCP_SYN, new_isn, 0, b""), o.next(&c2s(1000, 0, b"")))],
         );
-        // 旧 PENDING 立即 UNMATCHED + 清理（物理隔离），审计落一条。
+        // 旧 PENDING 立即 UNMATCHED（迁移 epoch）+ 清理（物理隔离），审计落一条。
         assert_eq!(pending_len(&reg, h, 0), 0);
         let p0 = pair_at(&reg, q0_idx).unwrap();
         assert_eq!(p0.status, QrStatus::Unmatched as u8);
@@ -1225,34 +1353,71 @@ mod tests {
         let dir = tmpdir("pseudo");
         let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
         let params = QrParams::default();
-        let mr = MetaRegistry::from_binds(&[]);
+        let sig: Vec<u8> = (0..64u32).map(|i| (i.wrapping_mul(0x9E3779B9) >> 16) as u8).collect();
         let mut o = Offset(0);
-        let mk_q = |seq: u32, ack: u32, off: &mut Offset| {
-            let payload: Vec<u8> = (0..32u32).map(|i| (i.wrapping_mul(0x9E3779B9) >> 16) as u8).collect();
-            let q = pkt(CIP, SIP, CPORT, 9999, TCP_ACK, seq, ack, &payload);
-            let idx = (1u64 << 32) | off.next(&q) as u64;
-            (q, idx)
-        };
-        // 两条同签名请求（不同 seq）→ 同伪键。
-        let (q1, i1) = mk_q(1001, 5001, &mut o);
-        let (q2, i2) = mk_q(1011, 5001, &mut o);
-        let mut m = QrMatcher::begin_with_meta(&reg, &params, Some(&mr)).unwrap();
-        for (rec, off) in [
-            (pkt(CIP, SIP, CPORT, 9999, TCP_SYN, 1000, 0, b""), o.next(&c2s(1000, 0, b""))),
-            (pkt(SIP, CIP, 9999, CPORT, TCP_SYN | TCP_ACK, 5000, 1001, b""), o.next(&s2c(5000, 1001, b""))),
-            (q1, i1 as u32),
-            (q2, i2 as u32),
-        ] {
-            m.ingest(&IndexedRecord { dev_id: 1, file_id: 1, offset: off, rec }).unwrap();
+
+        // 两连接（不同客户端口）同签名请求 → 伪键跨连接一致。
+        let mr = MetaRegistry::from_binds(&[]);
+        let mut q_idx_by_conn: Vec<u64> = Vec::new();
+        for (i, cport) in [30001u16, 30002u16].iter().enumerate() {
+            let mut m = QrMatcher::begin_with_meta(&reg, &params, Some(&mr)).unwrap();
+            let syn = pkt(CIP, SIP, *cport, 9999, TCP_SYN, 1000 + i as u32, 0, b"");
+            let synack = pkt(SIP, CIP, 9999, *cport, TCP_SYN | TCP_ACK, 5000 + i as u32, 1001, b"");
+            let ack = pkt(CIP, SIP, *cport, 9999, TCP_ACK, 1001 + i as u32, 5001 + i as u32, b"");
+            let q = pkt(CIP, SIP, *cport, 9999, TCP_ACK, 1001 + i as u32, 5001 + i as u32, &sig);
+            let syn_off = o.next(&syn);
+            let synack_off = o.next(&synack);
+            let ack_off = o.next(&ack);
+            let q_off = o.next(&q);
+            for (rec, off) in [
+                (syn, syn_off),
+                (synack, synack_off),
+                (ack, ack_off),
+                (q, q_off),
+            ] {
+                m.ingest(&IndexedRecord { dev_id: 1, file_id: 1, offset: off, rec }).unwrap();
+            }
+            m.commit().unwrap();
+            q_idx_by_conn.push((1u64 << 32) | q_off as u64);
         }
-        m.commit().unwrap();
-        let p1 = pair_at(&reg, i1).unwrap();
-        let p2 = pair_at(&reg, i2).unwrap();
+        let p1 = pair_at(&reg, q_idx_by_conn[0]).unwrap();
+        let p2 = pair_at(&reg, q_idx_by_conn[1]).unwrap();
         assert_eq!(p1.pseudo, 1);
         assert_eq!(p2.pseudo, 1);
-        assert_eq!(p1.req_key, p2.req_key, "同签名二进制载荷必须同伪键");
-        let h = conn_hash(1, u32::from_be_bytes(CIP), CPORT, u32::from_be_bytes(SIP), 9999, 6);
-        assert_eq!(conn_state_at(&reg, h).meta_bind_id, -1, "无规则 → 仅自动检测");
+        assert_eq!(p1.req_key, p2.req_key, "同签名二进制必须同伪键（跨连接）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 次级索引 status 去重（§13.4.1）：CONN_QR/QR_TIME 打开写一次、永不更新——终态翻转后
+    /// 索引 value 仍为 q_first_idx（非 status），status 语义只在 QR_PAIR 主行。
+    #[test]
+    fn secondary_index_no_status_semantics() {
+        let dir = tmpdir("secidx");
+        let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
+        let params = QrParams::default();
+        let mut o = Offset(0);
+        let q = c2s(1001, 5001, b"GET /a");
+        let q_idx = (1u64 << 32) | o.next(&q) as u64;
+        run(
+            &reg,
+            &params,
+            &[
+                (pkt(CIP, SIP, CPORT, SPORT, TCP_SYN, 1000, 0, b""), o.next(&c2s(1000, 0, b""))),
+                (pkt(SIP, CIP, SPORT, CPORT, TCP_SYN | TCP_ACK, 5000, 1001, b""), o.next(&s2c(5000, 1001, b""))),
+                (q.clone(), q_idx as u32),
+            ],
+        );
+        let et = reg.epoch_read_txn().unwrap();
+        // CONN_QR 索引行存在且 value = q_first_idx（纯定位，无 status 位）。
+        let key = k_conn_qr(ch(), 1001, q_idx);
+        let v = reg.epoch_dbs()[EPOCH_CONN_QR].get(&et, &key).unwrap().unwrap();
+        assert_eq!(v.len(), 8, "次级索引 value 为 q_first_idx 8B");
+        assert_eq!(u64::from_be_bytes(v[0..8].try_into().unwrap()), q_idx);
+        // QR_TIME 索引行同样为定位 value。
+        let key = k_qr_time(1001, q_idx);
+        let v = reg.epoch_dbs()[EPOCH_QR_TIME].get(&et, &key).unwrap().unwrap();
+        assert_eq!(u64::from_be_bytes(v[0..8].try_into().unwrap()), q_idx);
+        drop(et);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -12,7 +12,9 @@ use pcap_file::pcap::PcapReader;
 use sov_probe::wal::header::{TCP_ACK, TCP_SYN, WalRecord};
 use sov_vault::batch::BatchPipeline;
 use sov_vault::connection::ConnState;
-use sov_vault::db::{DbRegistry, QrPairValue, QrStatus, IDX_CONN_STATE, IDX_QR_PAIR, k_conn_state};
+use sov_vault::db::{
+    DbRegistry, QrPairValue, QrStatus, LIVE_CONN_STATE, k_conn_state, EPOCH_QR_PAIR,
+};
 use sov_vault::export::{BpfFilter, export_pcap};
 use sov_vault::ledger::Ledger;
 use sov_vault::qr::QrParams;
@@ -217,7 +219,6 @@ fn e2e_p5_stress_md5_hitrate_slowq() {
     let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
     let reg = DbRegistry::open(&dir.join("qridx"), 64 * 1024 * 1024).unwrap();
     let mut pipe = BatchPipeline::new(
-        &reg,
         &ledger,
         dir.join("hot"),
         1,
@@ -242,20 +243,20 @@ fn e2e_p5_stress_md5_hitrate_slowq() {
         } else {
             2
         };
-        let mut push = |rec: WalRecord| pipe.push_record(rec).unwrap();
+        let mut push = |rec: WalRecord| pipe.push_record(&reg, rec).unwrap();
         conn_traffic(cport, mode, &mut t0, &mut push, &mut src_payloads, &mut delayed);
     }
-    pipe.flush().unwrap(); // 批 1 提交（慢 Q 落 PENDING）。
+    pipe.flush(&reg).unwrap(); // 批 1 提交（慢 Q 落 PENDING）。
 
     // 第二批：慢连接的延迟响应（跨批慢路径消费）。
     for rec in &delayed {
-        pipe.push_record(rec.clone()).unwrap();
+        pipe.push_record(&reg, rec.clone()).unwrap();
     }
-    pipe.finish().unwrap(); // 批 2 提交。
+    pipe.finish(&reg).unwrap(); // 批 2 提交。
 
-    // ① QR 命中率与慢 Q 零丢失：全部 QRPAIR 终态 MATCHED。
-    let txn = reg.read_txn().unwrap();
-    let total = reg.dbs[IDX_QR_PAIR].len(&txn).unwrap();
+    // ① QR 命中率与慢 Q 零丢失：全部 QRPAIR 终态 MATCHED（epoch 库）。
+    let txn = reg.epoch_read_txn().unwrap();
+    let total = reg.epoch_dbs()[EPOCH_QR_PAIR].len(&txn).unwrap();
     let expect_total = (N_CONN - N_SLOW - N_PIPE) * N_REQ_EXACT
         + N_PIPE * N_PIPE_REQ
         + N_SLOW * 4;
@@ -263,7 +264,7 @@ fn e2e_p5_stress_md5_hitrate_slowq() {
 
     let mut matched = 0u64;
     let mut pipe_groups = 0u64;
-    let mut it = reg.dbs[IDX_QR_PAIR].iter(&txn).unwrap();
+    let mut it = reg.epoch_dbs()[EPOCH_QR_PAIR].iter(&txn).unwrap();
     for item in it.by_ref() {
         let (k, v) = item.unwrap();
         let q_idx = u64::from_be_bytes(k[0..8].try_into().unwrap());
@@ -304,8 +305,11 @@ fn e2e_p5_stress_md5_hitrate_slowq() {
             SPORT,
             6,
         );
-        let txn = reg.read_txn().unwrap();
-        let v = reg.dbs[IDX_CONN_STATE].get(&txn, &k_conn_state(h)).unwrap().unwrap();
+        let txn = reg.live_read_txn().unwrap();
+        let v = reg.live_dbs()[LIVE_CONN_STATE]
+            .get(&txn, &k_conn_state(h))
+            .unwrap()
+            .unwrap();
         let cs = ConnState::from_bytes(v).unwrap();
         drop(txn);
         assert_eq!(cs.qr_open, 0, "连接 {} qr_open 必须归零", cport);

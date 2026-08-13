@@ -26,7 +26,7 @@ use crate::ledger::{AnomalyEvent, Ledger};
 use crate::meta::MetaRegistry;
 use crate::qr::QrParams;
 use crate::reassembly::{Budgets, Event, Reassembler};
-use anyhow::{Context, Result};
+use anyhow::Result;
 use slim_common::framing::{
     decode_chunk_batch, decode_chunk_frame, decode_seal_frame, encode_gap_query, GapQuery,
 };
@@ -82,8 +82,9 @@ struct Stats {
 }
 
 /// 在线 ingest 主体：串行持有 Reassembler / 数据平面写器 / 流式解码器。
+/// 持有 `Box<DbRegistry>`（§13.8：epoch 轮转时可替换），pipeline 借用其注册表。
 struct LiveIngest<'a> {
-    reg: &'a DbRegistry,
+    reg: Box<DbRegistry>,
     ledger: &'a Ledger,
     decryptor: Decryptor,
     reassembler: Reassembler,
@@ -103,11 +104,13 @@ struct LiveIngest<'a> {
     fin_short_timeout_secs: u64,
     /// TTL 节流计数（每 1s tick 递增，达 ttl_scan_secs 后执行一次扫描）。
     ttl_ticks: u64,
+    /// epoch 轮转阈值（epoch_max_bytes）。
+    epoch_max_bytes: u64,
 }
 
 impl<'a> LiveIngest<'a> {
     fn new(
-        reg: &'a DbRegistry,
+        reg: Box<DbRegistry>,
         ledger: &'a Ledger,
         decryptor: Decryptor,
         reassembler: Reassembler,
@@ -134,35 +137,8 @@ impl<'a> LiveIngest<'a> {
             qr_timeout_secs: cfg.analysis.qr_timeout_secs,
             fin_short_timeout_secs: cfg.analysis.fin_short_timeout_secs,
             ttl_ticks: 0,
+            epoch_max_bytes: cfg.epoch_max_bytes().unwrap_or(128 * 1024 * 1024),
         }
-    }
-
-    /// 取（或创建）dev 对应的批量流水线。dev_id 隔离落盘目录，避免多探针串段。
-    /// 重启恢复：复用 dev 的 OPEN hot 文件（截断到 SQLite 水位线），杜绝 create_new 撞旧段文件。
-    fn pipeline_for(&mut self, dev_id: u32) -> Result<&mut BatchPipeline<'a>> {
-        let key = dev_id as i64;
-        if !self.pipelines.contains_key(&key) {
-            let dev_hot = self.hot_root.join(format!("dev{}", dev_id));
-            let pipe = BatchPipeline::open_or_recover(
-                self.reg,
-                self.ledger,
-                &dev_hot,
-                key,
-                0,
-                HOT_SEGMENT_SIZE,
-                self.batch_size,
-                self.qr_params,
-            )
-            .with_context(|| format!("创建 dev{} 批量流水线失败", dev_id))?;
-            if let Some(m) = &self.meta {
-                let mut p = pipe;
-                p.set_meta(m.clone());
-                self.pipelines.insert(key, p);
-            } else {
-                self.pipelines.insert(key, pipe);
-            }
-        }
-        Ok(self.pipelines.get_mut(&key).unwrap())
     }
 
     /// 处理一个 Chunk 批量帧：解帧 → 逐条解密 → 落位 → 处理事件。
@@ -244,12 +220,16 @@ impl<'a> LiveIngest<'a> {
         self.drain_events(events);
     }
 
-    /// 周期处理：重试在途 refill 的重封盘，按 ttl_scan_secs 节流推进 TTL 扫描。
+    /// 周期处理：重试在途 refill 的重封盘，按 ttl_scan_secs 节流推进 TTL 扫描，epoch 轮转检查。
     fn on_tick(&mut self, session: &Option<zenoh::Session>) {
         self.ttl_ticks += 1;
         if self.ttl_ticks >= self.ttl_secs.max(1) {
             self.ttl_ticks = 0;
             self.ttl_scan();
+            // epoch 轮转（§13.5）：历史库达上限才冻结/开新；live 库永不轮转。
+            if let Err(e) = self.maybe_rotate_epoch() {
+                tracing::error!("epoch 轮转失败: {}", e);
+            }
         }
         if !self.refills.is_empty() {
             let keys: Vec<(u32, u32)> = self.refills.keys().copied().collect();
@@ -326,15 +306,38 @@ impl<'a> LiveIngest<'a> {
                 } => {
                     let recs = self.feed_decoder(dev_id, segment_seq, &data);
                     self.total_records += recs.len() as u64;
-                    let pipe = match self.pipeline_for(dev_id) {
-                        Ok(p) => p,
-                        Err(e) => {
-                            tracing::error!("pipeline_for dev={} failed: {}", dev_id, e);
-                            continue;
+                    // 拆分借用：reg（不可变）与 pipelines（可变）为不同字段，直接字段级访问
+                    // 避免 `&mut self` 方法导致的整体借用冲突。
+                    let reg = &*self.reg;
+                    let key = dev_id as i64;
+                    if !self.pipelines.contains_key(&key) {
+                        let dev_hot = self.hot_root.join(format!("dev{}", dev_id));
+                        let pipe = BatchPipeline::open_or_recover(
+                            self.ledger,
+                            &dev_hot,
+                            key,
+                            0,
+                            HOT_SEGMENT_SIZE,
+                            self.batch_size,
+                            self.qr_params,
+                        )
+                        .map_err(|e| anyhow::anyhow!("创建 dev{} 批量流水线失败: {}", dev_id, e));
+                        match pipe {
+                            Ok(mut p) => {
+                                if let Some(m) = &self.meta {
+                                    p.set_meta(m.clone());
+                                }
+                                self.pipelines.insert(key, p);
+                            }
+                            Err(e) => {
+                                tracing::error!("pipeline_for dev={} failed: {}", dev_id, e);
+                                continue;
+                            }
                         }
-                    };
+                    }
+                    let pipe = self.pipelines.get_mut(&key).unwrap();
                     for r in recs {
-                        if let Err(e) = pipe.push_record(r) {
+                        if let Err(e) = pipe.push_record(reg, r) {
                             tracing::error!("push_record failed: {}", e);
                         }
                     }
@@ -345,8 +348,9 @@ impl<'a> LiveIngest<'a> {
                     ..
                 } => {
                     // 文件边界屏障：源段封盘 = 数据平面文件切换，先提交再轮转。
+                    let reg = &*self.reg;
                     if let Some(pipe) = self.pipelines.get_mut(&(dev_id as i64)) {
-                        if let Err(e) = pipe.finish() {
+                        if let Err(e) = pipe.finish(reg) {
                             tracing::error!("seal flush/rotate failed: {}", e);
                         }
                     }
@@ -454,7 +458,7 @@ impl<'a> LiveIngest<'a> {
             .unwrap_or(0);
         // serve 骨架下由外部协程负责；在线 ingest 主循环内联执行，避免跨线程共享 SQLite。
         match crate::anomaly::scan_pending_ttl(
-            self.reg,
+            &self.reg,
             now_ns,
             self.qr_timeout_secs,
             self.fin_short_timeout_secs,
@@ -503,11 +507,32 @@ impl<'a> LiveIngest<'a> {
     /// 收尾：flush 全部在途批量 + 摘要。
     fn finalize(&mut self) {
         for (dev, pipe) in self.pipelines.iter_mut() {
-            if let Err(e) = pipe.finish() {
+            if let Err(e) = pipe.finish(&self.reg) {
                 tracing::error!("finalize dev={} failed: {}", dev, e);
             }
         }
         self.log_stats();
+    }
+
+    /// epoch 轮转触发（§13.5）：当前 epoch 库 real_disk_size ≥ epoch_max_bytes →
+    /// 冻结当前 epoch（保持只读历史）→ 开启新 epoch env。live 库永不轮转。
+    /// 须在批次提交后、无活事务时调用；pipeline 以参数借 reg，不长期持有，故可安全 `&mut`。
+    fn maybe_rotate_epoch(&mut self) -> Result<()> {
+        match self.reg.epoch_should_rotate() {
+            Ok(true) => {
+                let old = self.reg.epoch_num();
+                let new = self.reg.rotate_epoch()?;
+                tracing::info!(
+                    "epoch 轮转: epoch_{:04} → epoch_{:04}（epoch_max_bytes={}B）",
+                    old,
+                    new,
+                    self.epoch_max_bytes
+                );
+                Ok(())
+            }
+            Ok(false) => Ok(()),
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -556,7 +581,11 @@ pub async fn run(cfg: &Config) -> Result<()> {
     }
     let ledger = Ledger::open(&cfg.ledger_path())?;
     let map_size = cfg.lmdb_map_size_bytes()? as usize;
-    let reg = DbRegistry::open(&cfg.lmdb_dir(), map_size)?;
+    let reg = Box::new(DbRegistry::open_with(
+        &cfg.lmdb_dir(),
+        map_size,
+        cfg.epoch_max_bytes()?,
+    )?);
 
     // MetaBind：幂等登记配置规则，构建带真实 id 的 MetaRegistry。
     let mut meta = MetaRegistry::from_binds(&cfg.analysis.meta_binds);
@@ -586,7 +615,7 @@ pub async fn run(cfg: &Config) -> Result<()> {
         cfg.ingest.conn_evict_threshold,
     );
     let reassembler = Reassembler::new(budgets);
-    let mut ingest = LiveIngest::new(&reg, &ledger, decryptor, reassembler, Some(meta), cfg);
+    let mut ingest = LiveIngest::new(reg, &ledger, decryptor, reassembler, Some(meta), cfg);
 
     // Zenoh 会话：显式 connect 端点（跨 VM 直连），无则回退默认。
     let mut zcfg = zenoh::Config::default();

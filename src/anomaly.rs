@@ -1,25 +1,27 @@
 //! P4 异常与慢路径：PENDING_TTL 定时超时扫描协程 + 终态事件审计。
 //!
-//! 设计依据：09 §九 P4（异常与慢路径）与 §七（异常台账可统计可回跳）。
+//! 设计依据：09 §9 P4（异常与慢路径）、§7（异常台账可统计可回跳）、§13.4.3（TTL 跨库读写）。
 //!
-//! - **TTL 扫描**：`DBI_PENDING_TTL` 键序 `[q_ts][conn_hash]` 天然按打开时间升序，
-//!   扫描上界 = `now - min(qr_timeout, fin_short_timeout)`（FIN 缩短后最紧的超时），
-//!   窗口内逐条评估 → 过期 PENDING Q 原子翻转 `TIMEOUT`（QRPAIR + 次级索引同 txn 软缓存一致），
-//!   清 QR_PENDING / PENDING_TTL，连接 qr_open 计数同步递减。
+//! - **TTL 扫描（双库模型，§13.4.3）**：`DBI_PENDING_TTL`（live 库）键序 `[q_ts][conn_hash]`
+//!   天然按打开时间升序，扫描上界 = `now - min(qr_timeout, fin_short_timeout)`（FIN 缩短后最紧超时），
+//!   窗口内逐条评估 → 过期 PENDING Q 原子翻转 `TIMEOUT` 并**迁移到当前 epoch 库**（§13.4.2 幂等）：
+//!   live 残留（QR_PENDING / PENDING_TTL / 在途 QR_PAIR）删除与连接状态写回同 live txn 原子。
 //! - **FIN 缩短超时**：`q_ts <= fin_seen`（FIN 发生在 Q 生命周期内）的挂起 Q，
 //!   按 `fin_seen + fin_short_timeout` 提前到期；代际翻转已物理清退旧 PENDING，
 //!   故 `q_ts > fin_seen` 的新代际 Q 绝不会被旧代际 FIN 误伤。
 //! - **终态审计**：TIMEOUT / UNMATCHED / RST_ABORT 全部逐 Q 落 `anomalies` 台账
 //!   （qr.rs 翻转路径 + 本模块 TTL 路径），`qr_id` 即数据平面 IDX 可回跳原文。
-//! - **幂等**：QRPAIR 已终态 / 主键缺失 → 仅清残留 TTL（stale），绝不重复翻转。
+//! - **幂等**：QRPAIR 已终态（epoch 已有）→ 仅清 live 残留（stale），绝不重复翻转/重复迁移。
+//!
+//! 提交顺序（epoch 先行，与 QrMatcher 一致）：epoch_txn.commit() → live_txn.commit()。
 
 use crate::connection::ConnState;
 use crate::db::{
-    k_conn_state, k_qr_pair, v_pending_ttl_decode, v_qr_pending_decode, DbRegistry, QrPairValue,
-    QrStatus, IDX_CONN_STATE, IDX_PENDING_TTL, IDX_QR_PAIR, IDX_QR_PENDING,
+    k_conn_state, k_qr_pair, put_no_overwrite, v_pending_ttl_decode, v_qr_pending_decode,
+    DbRegistry, QrPairValue, QrStatus, EPOCH_QR_PAIR, LIVE_CONN_STATE, LIVE_PENDING_TTL,
+    LIVE_QR_PAIR, LIVE_QR_PENDING,
 };
 use crate::ledger::{AnomalyEvent, Ledger};
-use crate::qr::write_secondary_status;
 use anyhow::Result;
 use std::collections::HashMap;
 use std::ops::Bound;
@@ -47,7 +49,7 @@ pub struct TtlScanStats {
     pub conns_touched: u64,
 }
 
-/// PENDING_TTL 扫描：过期 PENDING Q → TIMEOUT（同 txn 原子），返回逐 Q 审计事件。
+/// PENDING_TTL 扫描：过期 PENDING Q → TIMEOUT（迁移到 epoch），返回逐 Q 审计事件。
 ///
 /// - `now_ns`：当前单调时钟 ns（调用方传入，测试可注入）。
 /// - `qr_timeout_secs` / `fin_short_timeout_secs`：见 09 §11 `[analysis]`。
@@ -70,8 +72,9 @@ pub fn scan_pending_ttl(
     };
     let scan_hi_qts = now_ns.saturating_sub(short_ns);
 
-    let mut txn = reg.write_txn()?;
-    let db = reg.dbs[IDX_PENDING_TTL];
+    let mut live_txn = reg.live_write_txn()?;
+    let mut epoch_txn = reg.epoch_write_txn()?;
+    let db = reg.live_dbs()[LIVE_PENDING_TTL];
 
     // ① 收集窗口内候选（q_ts ≤ now - min_timeout）。键序升序 = 打开时间升序。
     let lo = [0u8; 16];
@@ -79,7 +82,7 @@ pub fn scan_pending_ttl(
     hi[0..8].copy_from_slice(&scan_hi_qts.to_be_bytes());
     hi[8..].fill(0xFF);
     let mut hits: Vec<(Vec<u8>, u64, u64, u64, u64)> = Vec::new(); // (ttl_key,q_ts,conn,q_first_idx,abs_q_end)
-    for item in db.range(&txn, &(Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice())))? {
+    for item in db.range(&live_txn, &(Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice())))? {
         let (k, v) = item?;
         stats.scanned += 1;
         let Some((q_first_idx, abs_q_end)) = v_pending_ttl_decode(v) else {
@@ -97,7 +100,7 @@ pub fn scan_pending_ttl(
     for (ttl_key, q_ts, h, q_first_idx, _abs_q_end) in hits {
         let st = conn_cache
             .entry(h)
-            .or_insert_with(|| load_conn(&txn, reg, h).ok().flatten().unwrap_or_default());
+            .or_insert_with(|| load_conn(&live_txn, reg, h).ok().flatten().unwrap_or_default());
 
         // 到期判定：基础 TTL vs FIN 缩短超时（二者取较早）。
         let base_deadline = q_ts.saturating_add(qr_timeout_ns);
@@ -110,30 +113,48 @@ pub fn scan_pending_ttl(
             continue; // 未到期（基础 TTL 窗口内、无 FIN 缩短）。
         }
 
-        // ③ QRPAIR 主行读改写（幂等：已终态仅清理残留）。
-        let dbp = reg.dbs[IDX_QR_PAIR];
-        let Some(vp) = dbp.get(&txn, &k_qr_pair(q_first_idx))? else {
-            cleanup_residual(reg, &mut txn, h, q_first_idx, &ttl_key)?;
+        // ③ 幂等迁移（§13.4.2）：先查 epoch → 已有终态则跳过、仅清 live 残留；
+        //    否则读 live(PENDING) → 翻转 TIMEOUT → 写 epoch（NO_OVERWRITE）→ 删 live。
+        let kp = k_qr_pair(q_first_idx);
+        let already_terminal = reg.epoch_dbs()[EPOCH_QR_PAIR]
+            .get(&epoch_txn, &kp)?
+            .is_some();
+        if already_terminal {
+            // 已迁移：仅清理 live 残留（幂等）。
+            reg.live_dbs()[LIVE_QR_PAIR].delete(&mut live_txn, &kp)?;
+            cleanup_pending(reg, &mut live_txn, h, q_first_idx)?;
+            reg.live_dbs()[LIVE_PENDING_TTL].delete(&mut live_txn, &ttl_key)?;
+            stats.stale += 1;
+            continue;
+        }
+
+        let Some(vp) = reg.live_dbs()[LIVE_QR_PAIR].get(&live_txn, &kp)? else {
+            cleanup_residual(reg, &mut live_txn, h, q_first_idx, &ttl_key)?;
             stats.stale += 1;
             continue;
         };
         let Some(mut pair) = QrPairValue::decode(vp) else {
-            cleanup_residual(reg, &mut txn, h, q_first_idx, &ttl_key)?;
+            cleanup_residual(reg, &mut live_txn, h, q_first_idx, &ttl_key)?;
             stats.stale += 1;
             continue;
         };
         if pair.status != QrStatus::Pending as u8 {
-            cleanup_residual(reg, &mut txn, h, q_first_idx, &ttl_key)?;
+            cleanup_residual(reg, &mut live_txn, h, q_first_idx, &ttl_key)?;
             stats.stale += 1;
             continue;
         }
 
         pair.status = QrStatus::Timeout as u8;
-        dbp.put(&mut txn, &k_qr_pair(q_first_idx), &pair.encode())?;
-        write_secondary_status(&reg.dbs, &mut txn, &pair, q_first_idx, QrStatus::Timeout)?;
+        put_no_overwrite(
+            &reg.epoch_dbs()[EPOCH_QR_PAIR],
+            &mut epoch_txn,
+            &kp,
+            &pair.encode(),
+        )?;
+        reg.live_dbs()[LIVE_QR_PAIR].delete(&mut live_txn, &kp)?;
         // 清 QR_PENDING（按连接前缀扫描，q_first_idx 匹配）+ 清 PENDING_TTL。
-        cleanup_pending(reg, &mut txn, h, q_first_idx)?;
-        reg.dbs[IDX_PENDING_TTL].delete(&mut txn, &ttl_key)?;
+        cleanup_pending(reg, &mut live_txn, h, q_first_idx)?;
+        reg.live_dbs()[LIVE_PENDING_TTL].delete(&mut live_txn, &ttl_key)?;
 
         // 连接侧：qr_open 递减 + 未匹配标记（L1 预算/审计口径同步）。
         st.qr_open = st.qr_open.saturating_sub(1);
@@ -151,12 +172,13 @@ pub fn scan_pending_ttl(
         stats.timed_out += 1;
     }
 
-    // ④ 连接状态写回。
+    // ④ 连接状态写回（live 库）。
     for (h, st) in &conn_cache {
-        reg.dbs[IDX_CONN_STATE].put(&mut txn, &k_conn_state(*h), &st.to_bytes())?;
+        reg.live_dbs()[LIVE_CONN_STATE].put(&mut live_txn, &k_conn_state(*h), &st.to_bytes())?;
         stats.conns_touched += 1;
     }
-    txn.commit()?;
+    epoch_txn.commit()?; // ⑤ epoch 先行
+    live_txn.commit()?; // ⑥ live 殿后
     Ok((events, stats))
 }
 
@@ -209,18 +231,18 @@ fn cleanup_residual(
     ttl_key: &[u8],
 ) -> Result<()> {
     cleanup_pending(reg, txn, h, q_first_idx)?;
-    reg.dbs[IDX_PENDING_TTL].delete(txn, ttl_key)?;
+    reg.live_dbs()[LIVE_PENDING_TTL].delete(txn, ttl_key)?;
     Ok(())
 }
 
-/// 按连接前缀扫描 QR_PENDING，删除 q_first_idx 匹配的条目（TTL 键不含 incarnation）。
+/// 按连接前缀扫描 QR_PENDING（live），删除 q_first_idx 匹配的条目（TTL 键不含 incarnation）。
 fn cleanup_pending(
     reg: &DbRegistry,
     txn: &mut heed::RwTxn<'_>,
     h: u64,
     q_first_idx: u64,
 ) -> Result<()> {
-    let db = reg.dbs[IDX_QR_PENDING];
+    let db = reg.live_dbs()[LIVE_QR_PENDING];
     let mut lo = [0u8; 16];
     lo[0..8].copy_from_slice(&h.to_be_bytes());
     let mut hi = [0u8; 16];
@@ -245,7 +267,7 @@ fn cleanup_pending(
 }
 
 fn load_conn(txn: &heed::RwTxn<'_>, reg: &DbRegistry, h: u64) -> Result<Option<ConnState>> {
-    let Some(v) = reg.dbs[IDX_CONN_STATE].get(txn, &k_conn_state(h))? else {
+    let Some(v) = reg.live_dbs()[LIVE_CONN_STATE].get(txn, &k_conn_state(h))? else {
         return Ok(None);
     };
     Ok(ConnState::from_bytes(v))
@@ -263,7 +285,7 @@ mod tests {
     use crate::connection::anomaly as conn_anomaly;
     use crate::connection::conn_hash;
     use crate::db::{
-        IDX_PENDING_TTL, IDX_QR_PAIR, IDX_QR_PENDING, k_conn_state, k_pending_ttl, k_qr_pair,
+        LIVE_PENDING_TTL, LIVE_QR_PENDING, k_conn_state, k_pending_ttl,
         k_qr_pending, k_qr_pending_prefix, v_pending_ttl_encode,
     };
     use crate::qr::{QrMatcher, QrParams};
@@ -354,27 +376,32 @@ mod tests {
     }
 
     fn pair_status(reg: &DbRegistry, q_first_idx: u64) -> u8 {
-        let txn = reg.read_txn().unwrap();
-        let v = reg.dbs[IDX_QR_PAIR].get(&txn, &k_qr_pair(q_first_idx)).unwrap().unwrap();
-        QrPairValue::decode(v).unwrap().status
+        let p = reg.qr_pair_at(q_first_idx).unwrap().unwrap();
+        p.status
     }
 
     fn pending_len(reg: &DbRegistry, h: u64, inc: u16) -> u64 {
-        let txn = reg.read_txn().unwrap();
+        let txn = reg.live_read_txn().unwrap();
         let lo = k_qr_pending_prefix(h, inc);
         let hi = k_qr_pending(h, inc, 0x0000_FFFF_FFFF_FFFF);
         let range = (Bound::Included(lo.as_slice()), Bound::Included(hi.as_slice()));
-        reg.dbs[IDX_QR_PENDING].range(&txn, &range).unwrap().count() as u64
+        reg.live_dbs()[LIVE_QR_PENDING]
+            .range(&txn, &range)
+            .unwrap()
+            .count() as u64
     }
 
     fn ttl_len(reg: &DbRegistry) -> u64 {
-        let txn = reg.read_txn().unwrap();
-        reg.dbs[IDX_PENDING_TTL].len(&txn).unwrap()
+        let txn = reg.live_read_txn().unwrap();
+        reg.live_dbs()[LIVE_PENDING_TTL].len(&txn).unwrap()
     }
 
     fn conn_state_at(reg: &DbRegistry, h: u64) -> ConnState {
-        let txn = reg.read_txn().unwrap();
-        let v = reg.dbs[IDX_CONN_STATE].get(&txn, &k_conn_state(h)).unwrap().unwrap();
+        let txn = reg.live_read_txn().unwrap();
+        let v = reg.live_dbs()[LIVE_CONN_STATE]
+            .get(&txn, &k_conn_state(h))
+            .unwrap()
+            .unwrap();
         ConnState::from_bytes(v).unwrap()
     }
 
@@ -395,12 +422,12 @@ mod tests {
 
         assert_eq!(stats.timed_out, 1);
         assert_eq!(stats.scanned, 1);
-        // 旧 Q → TIMEOUT + 清 pending/TTL + qr_open 归零。
+        // 旧 Q → TIMEOUT（迁移到 epoch）+ 清 pending/TTL + qr_open 归零。
         assert_eq!(pair_status(&reg, q_old), QrStatus::Timeout as u8);
         assert_eq!(pending_len(&reg, h_old, 0), 0);
         assert_eq!(conn_state_at(&reg, h_old).qr_open, 0);
         assert_ne!(conn_state_at(&reg, h_old).anomaly_flags & conn_anomaly::QR_UNMATCHED, 0);
-        // 新 Q 原样 PENDING。
+        // 新 Q 原样 PENDING（live 在途）。
         assert_eq!(pair_status(&reg, q_new), QrStatus::Pending as u8);
         assert_eq!(pending_len(&reg, h_new, 0), 1);
         assert_eq!(conn_state_at(&reg, h_new).qr_open, 1);
@@ -511,8 +538,8 @@ mod tests {
         let conn = 0xDEADBEEF;
         let key = k_pending_ttl(q_ts, conn);
         let val = v_pending_ttl_encode(777, 1000);
-        let mut txn = reg.write_txn().unwrap();
-        reg.dbs[IDX_PENDING_TTL].put(&mut txn, &key, &val).unwrap();
+        let mut txn = reg.live_write_txn().unwrap();
+        reg.live_dbs()[LIVE_PENDING_TTL].put(&mut txn, &key, &val).unwrap();
         // 无对应 QRPAIR → 残留清理。
         txn.commit().unwrap();
         let (_, stats) = scan_pending_ttl(&reg, now, 30, 5).unwrap();

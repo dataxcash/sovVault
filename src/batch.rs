@@ -1,7 +1,8 @@
-//! 批量原子性：一个 Batch = 一个 LMDB 事务（2PC-Lite）。
+//! 批量原子性：一个 Batch = 双 env 双事务（09 §13.4，epoch 先行）→ SQLite 殿后（2PC-Lite 收敛）。
 //!
-//! 提交协议（顺序不可颠倒，09 §5.2）：
-//!   ① LMDB 先行：本批全部索引数据在一个 RW_TXN 提交（逐条 NO_OVERWRITE，重放幂等）；
+//! 提交协议（顺序不可颠倒，09 §5.2 + §13.4）：
+//!   ① LMDB 双事务：QrMatcher 内部完成（RECORD_TS/终态 QR_PAIR/次级索引 → epoch_txn 先行；
+//!      CONN_STATE/QR_PENDING/PENDING_TTL/在途 QR_PAIR → live_txn 殿后；逐条 NO_OVERWRITE 幂等）；
 //!   ② SQLite 殿后：files.analysis_offset 水位线推进 + 文件状态；
 //!   ③ 内存游标推进（本批 pending 清空，由调用方在 commit 成功后执行）。
 //!
@@ -11,7 +12,11 @@
 //! 崩溃恢复（重启流程）：
 //!   1) 把 OPEN 状态的 hot 文件截断到 SQLite 水位线（数据平面写入无事务性，未提交尾部丢弃）；
 //!   2) 从旧水位线重新消费同一批记录；
-//!   3) 确定性主键 + MDB_NOOVERWRITE → 重放幂等收敛，零脏数据。
+//!   3) 确定性主键 + MDB_NOOVERWRITE + QR_PAIR 迁移幂等（§13.4.2）→ 重放收敛，零脏数据。
+//!
+//! > `BatchPipeline` 不再持有 `&DbRegistry`：`flush/push_record/finish` 以参数传入 `reg`，
+//! > 使 ingest/zenoh.rs 能在批次间隙对 `Box<DbRegistry>` 执行 epoch 轮转（`rotate_epoch`），
+//! > 关闭旧 epoch env（munmap）回收 RSS。
 
 use crate::db::{DbRegistry, RecordSummary};
 use crate::id;
@@ -297,8 +302,8 @@ impl<'a> HotFileWriter<'a> {
 }
 
 /// 批量流水线：推送记录 → 攒批 → 2PC-Lite 提交；文件边界强制屏障。
+/// 不持有 `&DbRegistry`（以参数传入），使 ingest 能在批次间隙执行 epoch 轮转。
 pub struct BatchPipeline<'a> {
-    reg: &'a DbRegistry,
     ledger: &'a Ledger,
     hot: HotFileWriter<'a>,
     pending: Vec<IndexedRecord>,
@@ -311,7 +316,6 @@ pub struct BatchPipeline<'a> {
 impl<'a> BatchPipeline<'a> {
     #[allow(clippy::too_many_arguments)] // 构造参数均为配置位，扁平可读优先。
     pub fn new(
-        reg: &'a DbRegistry,
         ledger: &'a Ledger,
         hot_dir: impl AsRef<Path>,
         dev_id: i64,
@@ -322,7 +326,6 @@ impl<'a> BatchPipeline<'a> {
     ) -> Result<BatchPipeline<'a>> {
         let hot = HotFileWriter::open(hot_dir, ledger, dev_id, segment_seq, segment_size)?;
         Ok(BatchPipeline {
-            reg,
             ledger,
             hot,
             pending: Vec::with_capacity(batch_size as usize),
@@ -342,7 +345,6 @@ impl<'a> BatchPipeline<'a> {
     /// （M7 实测：hot/dev1 遗留 segment_0000.wal → create_new AlreadyExists）。
     #[allow(clippy::too_many_arguments)] // 构造参数均为配置位，扁平可读优先。
     pub fn open_or_recover(
-        reg: &'a DbRegistry,
         ledger: &'a Ledger,
         hot_dir: impl AsRef<Path>,
         dev_id: i64,
@@ -354,7 +356,6 @@ impl<'a> BatchPipeline<'a> {
         let hot =
             HotFileWriter::open_or_recover(hot_dir, ledger, dev_id, segment_seq, segment_size)?;
         Ok(BatchPipeline {
-            reg,
             ledger,
             hot,
             pending: Vec::with_capacity(batch_size as usize),
@@ -364,11 +365,11 @@ impl<'a> BatchPipeline<'a> {
         })
     }
 
-    pub fn push_record(&mut self, rec: WalRecord) -> Result<()> {
+    pub fn push_record(&mut self, reg: &DbRegistry, rec: WalRecord) -> Result<()> {
         // 文件边界屏障：跨界 → 先强制提交当前批，再轮转封盘（逻辑事务绝不跨物理文件）。
         let rec_len = (64 + rec.payload.len()) as u64;
         if self.hot.offset() + rec_len > self.hot.segment_size && self.hot.offset() > 0 {
-            self.flush()?;
+            self.flush(reg)?;
             self.hot.rotate()?;
         }
         let (file_id, offset) = self.hot.append(&rec)?;
@@ -379,28 +380,28 @@ impl<'a> BatchPipeline<'a> {
             rec,
         });
         if self.pending.len() as u32 >= self.batch_size {
-            self.flush()?;
+            self.flush(reg)?;
         }
         Ok(())
     }
 
     /// 强制提交当前批（2PC-Lite），成功后清空 pending（=内存游标推进）。
-    pub fn flush(&mut self) -> Result<()> {
+    pub fn flush(&mut self, reg: &DbRegistry) -> Result<()> {
         if self.pending.is_empty() {
             return Ok(());
         }
         let records = std::mem::take(&mut self.pending);
         if let Some(meta) = &self.meta {
-            commit_batch_with_meta(self.reg, self.ledger, &records, &self.analysis, Some(meta))?;
+            commit_batch_with_meta(reg, self.ledger, &records, &self.analysis, Some(meta))?;
         } else {
-            commit_batch(self.reg, self.ledger, &records, &self.analysis)?;
+            commit_batch(reg, self.ledger, &records, &self.analysis)?;
         }
         Ok(())
     }
 
     /// 收尾：强制提交 + 封盘当前文件。
-    pub fn finish(&mut self) -> Result<()> {
-        self.flush()?;
+    pub fn finish(&mut self, reg: &DbRegistry) -> Result<()> {
+        self.flush(reg)?;
         self.hot.rotate()?;
         Ok(())
     }
@@ -428,7 +429,6 @@ fn now_secs() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::IDX_RECORD_TS;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn tmpdir(tag: &str) -> PathBuf {
@@ -460,8 +460,8 @@ mod tests {
     }
 
     fn record_ts_count(reg: &DbRegistry) -> u64 {
-        let txn = reg.read_txn().unwrap();
-        reg.dbs[IDX_RECORD_TS].len(&txn).unwrap()
+        let txn = reg.epoch_read_txn().unwrap();
+        reg.epoch_dbs()[crate::db::EPOCH_RECORD_TS].len(&txn).unwrap()
     }
 
     #[test]
@@ -484,7 +484,6 @@ mod tests {
         let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
         let reg = DbRegistry::open(&dir.join("qridx"), 10 * 1024 * 1024).unwrap();
         let mut pipe = BatchPipeline::new(
-            &reg,
             &ledger,
             dir.join("hot"),
             1,
@@ -496,9 +495,9 @@ mod tests {
         .unwrap();
         let fid = pipe.hot_file_id(); // 数据实际落在文件 1
         for i in 0..7u64 {
-            pipe.push_record(rec(i, &[i as u8; 10])).unwrap();
+            pipe.push_record(&reg, rec(i, &[i as u8; 10])).unwrap();
         }
-        pipe.finish().unwrap();
+        pipe.finish(&reg).unwrap();
         // batch_size=3：7 条 → 两次满批提交（3+3）+ 1 条收尾提交。
         assert_eq!(record_ts_count(&reg), 7);
         let wm = ledger.watermark(fid as i64).unwrap();

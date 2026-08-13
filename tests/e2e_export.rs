@@ -69,7 +69,6 @@ fn seed(dir: &Path) {
     let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
     let reg = DbRegistry::open(&dir.join("qridx"), 16 * 1024 * 1024).unwrap();
     let mut pipe = BatchPipeline::new(
-        &reg,
         &ledger,
         dir.join("hot"),
         1,
@@ -82,9 +81,9 @@ fn seed(dir: &Path) {
 
     let base = 1_700_000_000_000_000_000u64;
     // 握手（seq/ack/window 真实值）。
-    pipe.push_record(pkt(CIP, SIP, CPORT, SPORT, 6, TCP_SYN, base, 1000, 0, 65535, 0, b""))
+    pipe.push_record(&reg, pkt(CIP, SIP, CPORT, SPORT, 6, TCP_SYN, base, 1000, 0, 65535, 0, b""))
         .unwrap();
-    pipe.push_record(pkt(
+    pipe.push_record(&reg, pkt(
         SIP,
         CIP,
         SPORT,
@@ -99,10 +98,10 @@ fn seed(dir: &Path) {
         b"",
     ))
     .unwrap();
-    pipe.push_record(pkt(CIP, SIP, CPORT, SPORT, 6, TCP_ACK, base + 2, 1001, 5001, 65535, 0, b""))
+    pipe.push_record(&reg, pkt(CIP, SIP, CPORT, SPORT, 6, TCP_ACK, base + 2, 1001, 5001, 65535, 0, b""))
         .unwrap();
     // 裁切请求：orig 线上 2000B，落盘仅 21B（截断）→ [Packet size limited] 场景。
-    pipe.push_record(pkt(
+    pipe.push_record(&reg, pkt(
         CIP,
         SIP,
         CPORT,
@@ -118,7 +117,7 @@ fn seed(dir: &Path) {
     ))
     .unwrap();
     // 正常响应。
-    pipe.push_record(pkt(
+    pipe.push_record(&reg, pkt(
         SIP,
         CIP,
         SPORT,
@@ -134,11 +133,11 @@ fn seed(dir: &Path) {
     ))
     .unwrap();
     // 两条 UDP DNS（16B 载荷，orig=incl）。
-    pipe.push_record(pkt(CIP, SIP, CPORT, 53, 17, 0, base + 30, 0, 0, 0, 16, b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03\x03\x00\x01"))
+    pipe.push_record(&reg, pkt(CIP, SIP, CPORT, 53, 17, 0, base + 30, 0, 0, 0, 16, b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x03\x03\x00\x01"))
         .unwrap();
-    pipe.push_record(pkt(SIP, CIP, 53, CPORT, 17, 0, base + 40, 0, 0, 0, 16, b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00\x03\x03\x00\x01"))
+    pipe.push_record(&reg, pkt(SIP, CIP, 53, CPORT, 17, 0, base + 40, 0, 0, 0, 16, b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00\x03\x03\x00\x01"))
         .unwrap();
-    pipe.finish().unwrap();
+    pipe.finish(&reg).unwrap();
 }
 
 struct PcapPacketView {

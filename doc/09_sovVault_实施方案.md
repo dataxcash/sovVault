@@ -492,15 +492,22 @@ ingest 每条报文：
       终态 QR_PAIR 迁移 + CONN_QR/QR_KEY/QR_TIME/PACKET_QR 写 epoch_txn
 
 commit 顺序（不可颠倒）：
-  ① live_txn.commit()      （在途状态，量小，快）
   ② epoch_txn.commit()     （历史索引，NO_OVERWRITE 幂等）
+  ① live_txn.commit()      （在途状态/残留删除，量小，快）
   ③ SQLite 水位线 advance   （管理平面殿后）
 
+> **实现裁决（epoch 先行）**：§13.4.2 幂等表明确列出「写 epoch 后、删 live 前」为可达崩溃窗口——
+> 重放时 live 仍 PENDING、epoch 已有终态 → 先查 epoch 跳过迁移、仅清 live 残留。该窗口要求
+> epoch 必须先于 live 残留删除持久（迁移的 live QR_PAIR 删除与 CONN_STATE 在同一 live txn 原子）。
+> 若 live 先行删除 PENDING QR_PAIR 而 epoch 未持久，崩溃即丢 Q（违反「PENDING+异常 Q 零遗漏」）。
+> 故 commit 顺序取 **epoch 先行 → live 殿后**；epoch 只写「追加后只读」历史，先行提交不引入写锁竞争
+> （单写者串行化由 LMDB 保证）。详见 src/db.rs 模块注释。
+
 失败收敛（回放自愈，同 §5.5）：
-  - ①失败 → ②③未执行 → 整批 abort → 下轮从原水位线重放
-  - ①成功②失败 → ②③未执行 → 水位线未动 → 重放同批：
-      QR_PAIR 确定性键 `q_first_idx` + NO_OVERWRITE → 收敛零脏数据
-  - 崩溃于②后③前 → 水位线指旧位 → 重放收敛（同现有协议）
+  - ②失败 → ①②③未执行 → 整批 abort → 下轮从原水位线重放
+  - ②成功①失败 → ③未执行 → 水位线未动 → 重放同批：
+      QR_PAIR 确定性键 `q_first_idx` + 先查 epoch（已有则跳过迁移、仅清 live 残留）→ 收敛零脏数据
+  - 崩溃于①后③前 → 水位线指旧位 → 重放收敛（同现有协议）
 ```
 
 **原子性语义变化**：从「全有全无」变为「可重放收敛」。正确性由确定性主键 + 幂等写入保证（与现有 SQLite 殿后模型一致），审计事件 best-effort 落库不阻塞协议。
