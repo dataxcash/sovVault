@@ -559,6 +559,35 @@ TTL 扫描（`anomaly.rs`）复用同一套双库模型：
 | 历史时间窗 / 连接回溯 / PCAP 导出 | 枚举 `qridx/epoch_*/` 逐个打开聚合（低频交互） |
 | QR 详情（`qr --detail`） | live 库查在途 + epoch 库查终态，按 `q_first_idx` 定位 |
 
+### 13.5.1 epoch 时间边界索引 + 惰性打开（v0.4.1 L1+L2 落地）★
+
+> 背景：REPLAY/AUDIT/DIAG 是 v0.4 的核心消费方。旧 `QuerySession::open` 每次全量打开 live +
+> 全部历史 epoch，每个持 `static_read_txn` 直到会话结束——epoch 数一多，REPLAY 吞吐掉、DIAG 点查慢、
+> 句柄/mmap/reader slot 线性涨，违背「RSS 有界」初衷。v0.4.1 两刀治根：
+
+**L1 epoch 时间边界索引**：历史 epoch 数据冻结，唯一裁剪依据是时间。Ledger 加 `epochs` 表：
+`epoch_id | dir | min_ts | max_ts | record_count | state(FROZEN/ACTIVE)`。轮转冻结时
+（`ingest/zenoh.rs::maybe_rotate_epoch`，先读 `DbRegistry::current_epoch_bounds()` 再 upsert 再 rotate，
+失败不轮转下轮重试）写入边界。查询 `QuerySession::open_with_window(reg, ledger, start, end)`
+按 `[start_ts, end_ts]` 只挑命中的 epoch——从「全量打开 N 个」降到「窗口内 k 个」。
+规则：无时间窗 → 全保留；当前 epoch（max_ts 未知）→ 恒保留；无边界行（旧库/未冻结）→ 保留（宁可多扫）。
+
+**L2 惰性打开 + 短事务**：`QuerySession` 不再持有全部 epoch 的静态只读事务。
+历史 epoch 用即开、用完即关（数据冻结，随时读到最终态，无需持久 txn；env 句柄随函数返回即 drop →
+reader slot/mmap 随用随放）；仅 live + 当前 epoch 克隆 `DbRegistry` 已开 env 的短 txn（一致快照）。
+`page_rows_epochs` 扫到哪个 epoch 才 `open_epoch`，扫完 drop——峰值 = live + 当前 + 1 个历史。
+
+> 约束：heed/LMDB TLS reader 下同线程同一 env 并发开第二个会话会 `MDB_BAD_RSLOT`；
+> 使用约束为「同线程同时至多一个 QuerySession 存活」，CLI/export 单会话短生命周期天然满足。
+
+| 模块 | 改动 |
+|---|---|
+| `ledger.rs` | `epochs` 表 + `EpochBoundary/EpochState` + `upsert_epoch_boundary` / `epoch_boundaries` |
+| `db.rs` | `current_epoch_bounds()`（RECORD_TS first/last/len）；`epoch_targets()` / `epoch_num_of` |
+| `query.rs` | `QuerySession` 惰性打开重构；`open_with_window`（L1 裁剪）；`epoch_get`/`scan_epoch_range`/`prune_targets_by_window` |
+| `ingest/zenoh.rs` | `maybe_rotate_epoch` 冻结前写边界（先写后转，失败不轮转） |
+| `export.rs` / `main.rs` | `export_pcap` / `cmd_query` / `cmd_qr` 走 `open_with_window`（时间窗裁剪） |
+
 ### 13.6 配置与 CLI
 
 ```toml

@@ -625,6 +625,23 @@ impl DbRegistry {
         Ok(self.epoch.real_disk_size()?)
     }
 
+    /// L1：当前 epoch 的 RECORD_TS 时间边界与记录数——轮转冻结前调用，
+    /// 作为 epoch 边界索引（Ledger `epochs` 表）的写入来源。
+    /// 返回 (min_ts, max_ts, record_count)，空 epoch 为 (None, None, 0)。
+    pub fn current_epoch_bounds(&self) -> Result<(Option<u64>, Option<u64>, u64)> {
+        let txn = self.epoch_read_txn()?;
+        let db = self.epoch_dbs[EPOCH_RECORD_TS];
+        let len = db.len(&txn)?;
+        let first = db.first(&txn)?.and_then(|(k, _)| record_key_ts(k));
+        let last = db.last(&txn)?.and_then(|(k, _)| record_key_ts(k));
+        Ok((first, last, len))
+    }
+
+    /// 枚举已存在的 (epoch_num, dir) 对（升序；含当前 epoch）。
+    pub fn epoch_targets(&self) -> Vec<(u32, PathBuf)> {
+        epoch_targets(&self.root)
+    }
+
     /// epoch 轮转：冻结当前 epoch（保持只读历史），开启下一个 epoch env。
     /// 旧 env 随字段赋值被 drop → munmap → 完整回收其 RSS（M7 实测 drop env 后 RSS 25.9MB→2.2MB）。
     /// 调用方必须在无活事务（commit 后）时调用。
@@ -712,6 +729,29 @@ fn epoch_dirs(root: &Path) -> Vec<PathBuf> {
     }
     dirs.sort();
     dirs
+}
+
+/// 枚举 (epoch_num, dir) 升序对（查询裁剪 / 惰性打开的候选集）。
+pub fn epoch_targets(root: &Path) -> Vec<(u32, PathBuf)> {
+    let mut out: Vec<(u32, PathBuf)> = Vec::new();
+    for d in epoch_dirs(root) {
+        if let Some(n) = epoch_num_of(&d) {
+            out.push((n, d));
+        }
+    }
+    out.sort_by_key(|(n, _)| *n);
+    out
+}
+
+/// 从目录名提取 epoch 序号：`epoch_0003` → 3。
+pub fn epoch_num_of(dir: &Path) -> Option<u32> {
+    let name = dir.file_name()?.to_str()?;
+    name.strip_prefix("epoch_")?.parse().ok()
+}
+
+/// RECORD_TS 键 `[ts_ns:u64][packet_idx:u64]` 的时间段（前 8B 大端）。
+fn record_key_ts(k: &[u8]) -> Option<u64> {
+    Some(u64::from_be_bytes(k.get(0..8)?.try_into().ok()?))
 }
 
 /// NO_OVERWRITE 幂等写入：键已存在（KeyExist）返回 Ok(false)，否则写入返回 Ok(true)。
@@ -955,6 +995,43 @@ mod tests {
         let sz = reg.real_disk_size().unwrap();
         assert!(sz > 0 && sz < 10 * 1024 * 1024);
         assert!(!reg.epoch_should_rotate().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn current_epoch_bounds_tracks_records() {
+        let dir = tmpdir("ceb");
+        let reg = DbRegistry::open(&dir, 10 * 1024 * 1024).unwrap();
+        // 空 epoch：无边界。
+        assert_eq!(reg.current_epoch_bounds().unwrap(), (None, None, 0));
+
+        // 写 3 条 RECORD_TS（ts 递增、乱序写入验证 first/last 取键序而非写序）。
+        let mut txn = reg.epoch_write_txn().unwrap();
+        for (ts, idx) in [(300, 3), (100, 1), (200, 2)] {
+            reg.epoch_dbs()[EPOCH_RECORD_TS]
+                .put(&mut txn, &k_record_ts(ts, idx), &v_record_summary_encode(&RecordSummary::default()))
+                .unwrap();
+        }
+        txn.commit().unwrap();
+
+        let (min_ts, max_ts, count) = reg.current_epoch_bounds().unwrap();
+        assert_eq!(min_ts, Some(100));
+        assert_eq!(max_ts, Some(300));
+        assert_eq!(count, 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn epoch_targets_sorted_and_parsed() {
+        let dir = tmpdir("tgt");
+        let root = dir.join("qridx");
+        let mut reg = DbRegistry::open(&root, 10 * 1024 * 1024).unwrap();
+        reg.rotate_epoch().unwrap();
+        let targets = reg.epoch_targets();
+        assert_eq!(targets, vec![(0, root.join("epoch_0000")), (1, root.join("epoch_0001"))]);
+        // 目录名解析。
+        assert_eq!(epoch_num_of(&root.join("epoch_0003")).unwrap(), 3);
+        assert_eq!(epoch_num_of(&root.join("live")), None);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

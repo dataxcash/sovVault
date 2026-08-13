@@ -266,6 +266,8 @@ impl<'r, W: Write> PcapSink<'r, W> {
 
 /// 流式导出：`DBI_RECORD_TS` 游标翻页打满（has_more 键级判定，天然防断流），
 /// 全量时间窗可选；返回写入的报文数。
+/// L1：带时间窗时按 epoch 边界索引裁剪历史 epoch（只挑窗口内命中的），
+/// 历史 epoch 惰性打开、用完即关（L2）——REPLAY/PCAP 导出热路径吞吐不随历史总量衰减。
 pub fn export_pcap<W: Write>(
     reg: &DbRegistry,
     ledger: &Ledger,
@@ -276,7 +278,7 @@ pub fn export_pcap<W: Write>(
 ) -> Result<PcapStats> {
     let f = RecordFilter { start_ts, end_ts };
     let mut sink = PcapSink::new(out, ledger, filter)?;
-    let s = QuerySession::open(reg)?;
+    let s = QuerySession::open_with_window(reg, ledger, start_ts, end_ts)?;
     let mut page = Page::default();
     loop {
         let r = s.scan_records(&f, &page)?;

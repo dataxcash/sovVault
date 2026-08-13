@@ -322,7 +322,9 @@ fn cmd_query(cfg: &Config, start: Option<u64>, end: Option<u64>, limit: usize) -
         cfg.lmdb_map_size_bytes()? as usize,
         cfg.epoch_max_bytes()?,
     )?;
-    let s = QuerySession::open(&reg)?;
+    let ledger = Ledger::open(&cfg.ledger_path())?;
+    // L1：按时间窗裁剪历史 epoch（epoch 边界索引），REPLAY/DIAG 只扫窗口内命中的 epoch。
+    let s = QuerySession::open_with_window(&reg, &ledger, start, end)?;
     let f = RecordFilter {
         start_ts: start,
         end_ts: end,
@@ -360,7 +362,9 @@ fn cmd_qr(
         cfg.lmdb_map_size_bytes()? as usize,
         cfg.epoch_max_bytes()?,
     )?;
-    let s = QuerySession::open(&reg)?;
+    let ledger = Ledger::open(&cfg.ledger_path())?;
+    // L1：带时间窗时按 epoch 边界裁剪；无窗 = 全 epoch（裁剪函数内部兜底）。
+    let s = QuerySession::open_with_window(&reg, &ledger, start, end)?;
     let status = match status {
         Some(raw) => Some(
             QrStatus::parse(&raw)

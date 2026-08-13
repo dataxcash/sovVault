@@ -22,7 +22,7 @@ use crate::batch::BatchPipeline;
 use crate::config::Config;
 use crate::db::DbRegistry;
 use crate::decrypt::Decryptor;
-use crate::ledger::{AnomalyEvent, Ledger};
+use crate::ledger::{AnomalyEvent, EpochBoundary, EpochState, Ledger};
 use crate::meta::MetaRegistry;
 use crate::qr::QrParams;
 use crate::reassembly::{Budgets, Event, Reassembler};
@@ -517,16 +517,31 @@ impl<'a> LiveIngest<'a> {
     /// epoch 轮转触发（§13.5）：当前 epoch 库 real_disk_size ≥ epoch_max_bytes →
     /// 冻结当前 epoch（保持只读历史）→ 开启新 epoch env。live 库永不轮转。
     /// 须在批次提交后、无活事务时调用；pipeline 以参数借 reg，不长期持有，故可安全 `&mut`。
+    /// L1：冻结前把当前 epoch 的时间边界写入 Ledger `epochs` 表（查询裁剪依据）。
     fn maybe_rotate_epoch(&mut self) -> Result<()> {
         match self.reg.epoch_should_rotate() {
             Ok(true) => {
                 let old = self.reg.epoch_num();
+                // 冻结边界必须在 rotate 前读取——rotate 后 reg.epoch 已指向新 env。
+                let (min_ts, max_ts, record_count) = self.reg.current_epoch_bounds()?;
+                // 先写边界（失败则不轮转，下轮重试；成功后被轮转掉的历史 epoch 有裁剪依据）。
+                self.ledger.upsert_epoch_boundary(&EpochBoundary {
+                    epoch_id: old as i64,
+                    dir: format!("epoch_{:04}", old),
+                    min_ts: min_ts.map(|v| v as i64),
+                    max_ts: max_ts.map(|v| v as i64),
+                    record_count: record_count as i64,
+                    state: EpochState::Frozen,
+                })?;
                 let new = self.reg.rotate_epoch()?;
                 tracing::info!(
-                    "epoch 轮转: epoch_{:04} → epoch_{:04}（epoch_max_bytes={}B）",
+                    "epoch 轮转: epoch_{:04} → epoch_{:04}（epoch_max_bytes={}B, 边界[{:?},{:?}], 记录={}）",
                     old,
                     new,
-                    self.epoch_max_bytes
+                    self.epoch_max_bytes,
+                    min_ts,
+                    max_ts,
+                    record_count
                 );
                 Ok(())
             }

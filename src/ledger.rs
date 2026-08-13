@@ -43,6 +43,28 @@ pub struct AnomalyEvent {
     pub detail: Option<String>,
 }
 
+/// epochs.state：0=FROZEN（已轮转冻结，追加后只读）1=ACTIVE（当前写入）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(i64)]
+pub enum EpochState {
+    Frozen = 0,
+    Active = 1,
+}
+
+/// epochs 表行：epoch 时间边界索引（v0.4.1 L1 ★）。
+///
+/// 历史 epoch 数据冻结，唯一查询裁剪依据是时间。轮转冻结时写一行，
+/// 查询按 `[start_ts, end_ts]` 只挑命中的 epoch，从「全量打开 N 个」降到「窗口内 k 个」。
+#[derive(Debug, Clone)]
+pub struct EpochBoundary {
+    pub epoch_id: i64,
+    pub dir: String,
+    pub min_ts: Option<i64>,
+    pub max_ts: Option<i64>,
+    pub record_count: i64,
+    pub state: EpochState,
+}
+
 /// meta_binds 表行（Meta 子命令 / 查询展示）。
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct MetaBindRow {
@@ -110,7 +132,14 @@ impl Ledger {
                dst_port INTEGER, hit_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL);
              CREATE TABLE IF NOT EXISTS meta_binds(id INTEGER PRIMARY KEY AUTOINCREMENT,
                name TEXT NOT NULL, proto INTEGER, dst_port INTEGER, dst_ip TEXT,
-               fingerprint TEXT, extractor TEXT, enabled INTEGER DEFAULT 1);",
+               fingerprint TEXT, extractor TEXT, enabled INTEGER DEFAULT 1);
+             CREATE TABLE IF NOT EXISTS epochs(
+               epoch_id INTEGER PRIMARY KEY,
+               dir TEXT NOT NULL UNIQUE,
+               min_ts INTEGER, max_ts INTEGER,
+               record_count INTEGER NOT NULL DEFAULT 0,
+               state INTEGER NOT NULL DEFAULT 0);
+             CREATE INDEX IF NOT EXISTS idx_epochs_state ON epochs(state);",
         )?;
         Ok(())
     }
@@ -520,6 +549,72 @@ impl Ledger {
         Ok(n)
     }
 
+    /// L1：epoch 边界 upsert（按 epoch_id 查改插）。轮转冻结时写一次，重放/重启重跑收敛。
+    pub fn upsert_epoch_boundary(&self, e: &EpochBoundary) -> Result<()> {
+        let existing: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT epoch_id FROM epochs WHERE epoch_id = ?1",
+                params![e.epoch_id],
+                |r| r.get(0),
+            )
+            .optional()?;
+        if let Some(_id) = existing {
+            self.conn.execute(
+                "UPDATE epochs SET dir=?2, min_ts=?3, max_ts=?4, record_count=?5, state=?6
+                 WHERE epoch_id=?1",
+                params![
+                    e.epoch_id,
+                    e.dir,
+                    e.min_ts,
+                    e.max_ts,
+                    e.record_count,
+                    e.state as i64
+                ],
+            )?;
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO epochs(epoch_id, dir, min_ts, max_ts, record_count, state)
+             VALUES(?1,?2,?3,?4,?5,?6)",
+            params![
+                e.epoch_id,
+                e.dir,
+                e.min_ts,
+                e.max_ts,
+                e.record_count,
+                e.state as i64
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// L1：全部 epoch 边界（按 epoch_id 升序）。
+    pub fn epoch_boundaries(&self) -> Result<Vec<EpochBoundary>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT epoch_id, dir, min_ts, max_ts, record_count, state
+             FROM epochs ORDER BY epoch_id",
+        )?;
+        let rows = stmt.query_map([], |r| {
+            Ok(EpochBoundary {
+                epoch_id: r.get(0)?,
+                dir: r.get(1)?,
+                min_ts: r.get(2)?,
+                max_ts: r.get(3)?,
+                record_count: r.get(4)?,
+                state: match r.get::<_, i64>(5)? {
+                    0 => EpochState::Frozen,
+                    _ => EpochState::Active,
+                },
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
     pub fn conn(&self) -> &Connection {
         &self.conn
     }
@@ -643,6 +738,53 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].hit_count, 2);
         assert_eq!(rows[0].magic_prefix.as_deref(), Some(&b"GET "[..]));
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn epoch_boundary_upsert_and_list() {
+        let p = tmpdb("epoch");
+        let l = Ledger::open(&p).unwrap();
+        assert!(l.epoch_boundaries().unwrap().is_empty());
+
+        l.upsert_epoch_boundary(&EpochBoundary {
+            epoch_id: 0,
+            dir: "epoch_0000".into(),
+            min_ts: Some(1000),
+            max_ts: Some(2000),
+            record_count: 42,
+            state: EpochState::Frozen,
+        })
+        .unwrap();
+        l.upsert_epoch_boundary(&EpochBoundary {
+            epoch_id: 1,
+            dir: "epoch_0001".into(),
+            min_ts: Some(2001),
+            max_ts: Some(3000),
+            record_count: 7,
+            state: EpochState::Frozen,
+        })
+        .unwrap();
+
+        // 幂等：同 epoch_id 重写只更新、不重复插行。
+        l.upsert_epoch_boundary(&EpochBoundary {
+            epoch_id: 0,
+            dir: "epoch_0000".into(),
+            min_ts: Some(1000),
+            max_ts: Some(2500),
+            record_count: 50,
+            state: EpochState::Frozen,
+        })
+        .unwrap();
+
+        let rows = l.epoch_boundaries().unwrap();
+        assert_eq!(rows.len(), 2, "重写不产生重复行");
+        assert_eq!(rows[0].epoch_id, 0);
+        assert_eq!(rows[0].max_ts, Some(2500), "幂等更新 max_ts");
+        assert_eq!(rows[0].record_count, 50);
+        assert_eq!(rows[0].state, EpochState::Frozen);
+        assert_eq!(rows[1].epoch_id, 1);
+        assert_eq!(rows[1].dir, "epoch_0001");
         let _ = std::fs::remove_file(&p);
     }
 }

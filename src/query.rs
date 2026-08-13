@@ -6,8 +6,15 @@
 //! - **live 库**（单库，无跨库）：连接热状态 `conn_state`；在途 QR_PAIR(PENDING)。
 //! - **epoch 库**（枚举 `qridx/epoch_*/`，追加后只读）：终态 QR_PAIR、CONN_QR/QR_TIME/PACKET_QR/RECORD_TS。
 //!
-//! `QuerySession` 持有 live env + 全部 epoch env 的只读事务快照，跨库枚举聚合；
-//! 历史查询确定性排序 = **epoch 序号升序 + 库内主键序**（09 §13.9.4）。
+//! ## v0.4.1 查询裁剪与惰性打开（L1+L2）★
+//! - **L1 epoch 时间边界索引**：历史 epoch 数据冻结，唯一裁剪依据是时间。Ledger `epochs` 表
+//!   存 (epoch_id, dir, min_ts, max_ts, record_count, state)；轮转冻结时写入。
+//!   `open_with_window` 按 `[start_ts, end_ts]` 只挑命中的 epoch，从「全量打开 N 个」降到「窗口内 k 个」。
+//! - **L2 惰性打开 + 短事务**：`QuerySession` 不再持有全部 epoch 的静态只读事务。
+//!   历史 epoch 用即开、用完即关（数据冻结，随时读到最终态，无需持久 txn）；
+//!   仅 live + 当前 epoch 克隆 `DbRegistry` 已开 env 的短 txn（保证一致快照）。
+//!   `page_rows_epochs` 扫到哪个 epoch 才 open，扫完 drop → reader slot / mmap 随用随放，
+//!   峰值 = live + 当前 + 1 个历史。
 //!
 //! ## 次级索引 status 去重（§13.4.1）★
 //! CONN_QR / QR_TIME 的 value 不再存 status（Q 打开写一次、永不更新）。因此：
@@ -26,10 +33,12 @@ use crate::db::{
     EPOCH_PACKET_QR, EPOCH_QR_PAIR, EPOCH_QR_TIME, EPOCH_RECORD_TS, LIVE_CONN_STATE, LIVE_QR_PAIR,
     NUM_EPOCH_DBIS,
 };
+use crate::ledger::{EpochBoundary, Ledger};
 use anyhow::{bail, Result};
 use heed::types::Bytes;
 use heed::Database;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::io::Write;
 use std::ops::Bound;
 use std::path::Path;
@@ -99,63 +108,127 @@ pub struct RecordRow {
     pub summary: RecordSummary,
 }
 
-/// 已打开的一个 epoch env（只读快照）。
+/// 已打开的一个 epoch env（只读快照；L2 惰性——用即开、用完即关）。
 struct OpenedEpoch {
-    /// epoch 序号（排序键，升序聚合）。
-    num: u32,
     txn: heed::RoTxn<'static, heed::WithTls>,
     dbs: [Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
 }
 
-/// 只读查询会话：live + 全部 epoch 的快照，多维检索跨库聚合。
+/// epoch 候选目标（L1 裁剪后保留的子集）。
+struct EpochTarget {
+    num: u32,
+    dir: std::path::PathBuf,
+    /// 当前 epoch（DbRegistry 已开 env，克隆快照即可；历史 epoch 惰性重开只读）。
+    is_current: bool,
+}
+
+/// 只读查询会话：live + 当前 epoch 快照（常驻）+ 历史 epoch 惰性打开（用完即关）。
+///
+/// L2 之后不再持有全部 epoch 的静态事务：reader slot / mmap 峰值 = live + 当前 + 1 个历史；
+/// L1 之后候选集按时间窗裁剪（`open_with_window`）。
+///
+/// > 注意（heed/LMDB TLS reader）：`static_read_txn` 同线程对同一 env 并发开第二个会话
+/// > 会触发 `MDB_BAD_RSLOT`。使用约束：**同一线程同一时刻至多一个 QuerySession 存活**；
+/// > 实际消费路径（CLI 查询 / export / stream_*）均单会话短生命周期，天然满足。
 pub struct QuerySession {
-    /// live 库（连接热状态 / 在途 QR_PAIR）。
+    /// live 库（连接热状态 / 在途 QR_PAIR，量有界，会话内快照）。
     live_txn: heed::RoTxn<'static, heed::WithTls>,
     live_dbs: [Database<Bytes, Bytes>; crate::db::NUM_LIVE_DBIS],
-    /// 全部 epoch 库（含当前 epoch 的只读快照），按 num 升序。
-    epochs: Vec<OpenedEpoch>,
+    /// 当前 epoch 快照（写 env 克隆，保证一致快照）。
+    cur_txn: heed::RoTxn<'static, heed::WithTls>,
+    cur_dbs: [Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
+    /// 候选 epoch（含当前；升序；已按时间窗裁剪）。
+    targets: Vec<EpochTarget>,
+    map_size: usize,
 }
 
 impl QuerySession {
-    /// 打开只读查询会话：live + 枚举全部 epoch（当前 epoch 用写 env 的同目录快照，
-    /// 历史 epoch 用 READ_ONLY 重开——不占用写 env 的 reader slot 竞争）。
+    /// 打开只读查询会话：live + 当前 epoch 快照 + 全部历史 epoch（惰性打开，L2）。
     pub fn open(reg: &DbRegistry) -> Result<QuerySession> {
+        QuerySession::build(reg, None, None, None)
+    }
+
+    /// L1：打开只读查询会话并按 `[start_ts, end_ts]` 裁剪历史 epoch。
+    /// 依据 Ledger `epochs` 表（轮转冻结时写入）只挑时间窗内命中的 epoch；
+    /// 无边界行（旧库/未轮转）不裁剪、当前 epoch 不裁剪——保证正确性优先。
+    pub fn open_with_window(
+        reg: &DbRegistry,
+        ledger: &Ledger,
+        start_ts: Option<u64>,
+        end_ts: Option<u64>,
+    ) -> Result<QuerySession> {
+        QuerySession::build(reg, Some(ledger), start_ts, end_ts)
+    }
+
+    fn build(
+        reg: &DbRegistry,
+        ledger: Option<&Ledger>,
+        start_ts: Option<u64>,
+        end_ts: Option<u64>,
+    ) -> Result<QuerySession> {
         let live_txn = reg.live_env().clone().static_read_txn()?;
         let live_dbs = *reg.live_dbs();
-
-        let mut epochs = Vec::new();
-        // 当前 epoch：从 DbRegistry 已打开的 env 克隆快照（与写 env 同一目录，复用其元数据页）。
         let cur_txn = reg.epoch_env().clone().static_read_txn()?;
-        let cur = OpenedEpoch {
-            num: reg.epoch_num(),
-            txn: cur_txn,
-            dbs: *reg.epoch_dbs(),
-        };
-        epochs.push(cur);
+        let cur_dbs = *reg.epoch_dbs();
 
-        // 历史 epoch：READ_ONLY 重开（追加后只读，无需写锁）。DBI 必须在同一 txn 内打开——
-        // LMDB 只读事务中 mdb_dbi_open 只注册于当前 txn（me_dbflags 不更新），跨事务使用会 EINVAL。
-        for dir in reg.epoch_dirs() {
-            let Some(num) = epoch_num_of(&dir) else { continue };
-            if num == reg.epoch_num() {
-                continue; // 当前 epoch 已在上面快照。
-            }
-            let env = crate::db::open_epoch_env_read_only(&dir, reg.map_size())?;
-            let txn = env.clone().static_read_txn()?;
-            let dbs = crate::db::open_epoch_dbs_in_txn(&env, &txn)?;
-            epochs.push(OpenedEpoch { num, txn, dbs });
+        let mut targets: Vec<EpochTarget> = reg
+            .epoch_targets()
+            .into_iter()
+            .map(|(num, dir)| EpochTarget {
+                num,
+                dir,
+                is_current: num == reg.epoch_num(),
+            })
+            .collect();
+        if let Some(ledger) = ledger {
+            targets = prune_targets_by_window(targets, ledger, start_ts, end_ts)?;
         }
-        // 确定性排序：epoch 序号升序（§13.9.4）。
-        epochs.sort_by_key(|e| e.num);
 
         Ok(QuerySession {
             live_txn,
             live_dbs,
-            epochs,
+            cur_txn,
+            cur_dbs,
+            targets,
+            map_size: reg.map_size(),
         })
     }
 
-    /// QRPAIR 主键直查：live（在途 PENDING）→ 全部 epoch（终态）→ 按 q_first_idx 定位。
+    /// L2：惰性打开历史 epoch（数据冻结，用即开、用完即关；`static_read_txn` 持 env 引用计数，
+    /// env 句柄随函数返回即 drop → reader slot 随用随放）。
+    fn open_epoch(&self, _num: u32, dir: &Path) -> Result<OpenedEpoch> {
+        let env = crate::db::open_epoch_env_read_only(dir, self.map_size)?;
+        let txn = env.clone().static_read_txn()?;
+        let dbs = crate::db::open_epoch_dbs_in_txn(&env, &txn)?;
+        Ok(OpenedEpoch { txn, dbs })
+    }
+
+    /// 跨全部候选 epoch 的 O(logN) 点查（当前 epoch 快照 + 历史惰性重开），先命中即返回。
+    fn epoch_get<T>(
+        &self,
+        db_idx: usize,
+        key: &[u8],
+        decode: impl Fn(&[u8]) -> Option<T>,
+    ) -> Result<Option<T>> {
+        for t in &self.targets {
+            let hit: Option<T> = if t.is_current {
+                self.cur_dbs[db_idx]
+                    .get(&self.cur_txn, key)?
+                    .and_then(&decode)
+            } else {
+                let o = self.open_epoch(t.num, &t.dir)?;
+                let r = o.dbs[db_idx].get(&o.txn, key)?.and_then(&decode);
+                drop(o);
+                r
+            };
+            if hit.is_some() {
+                return Ok(hit);
+            }
+        }
+        Ok(None)
+    }
+
+    /// QRPAIR 主键直查：live（在途 PENDING）→ 候选 epoch（终态）→ 按 q_first_idx 定位。
     /// O(logN) 点查，回跳基因锚。
     pub fn qr_by_idx(&self, q_first_idx: u64) -> Result<Option<QrPairValue>> {
         let kp = k_qr_pair(q_first_idx);
@@ -164,23 +237,13 @@ impl QuerySession {
                 return Ok(Some(p));
             }
         }
-        for e in &self.epochs {
-            if let Some(v) = e.dbs[EPOCH_QR_PAIR].get(&e.txn, &kp)? {
-                return Ok(QrPairValue::decode(v));
-            }
-        }
-        Ok(None)
+        self.epoch_get(EPOCH_QR_PAIR, &kp, QrPairValue::decode)
     }
 
-    /// PACKET_QR 反查：报文 IDX → 所属 Q 首包 IDX（跨全部 epoch，O(logN) 点查）。
+    /// PACKET_QR 反查：报文 IDX → 所属 Q 首包 IDX（跨候选 epoch，O(logN) 点查）。
     pub fn qr_by_packet(&self, packet_idx: u64) -> Result<Option<u64>> {
         let kp = k_packet_qr(packet_idx);
-        for e in &self.epochs {
-            if let Some(v) = e.dbs[EPOCH_PACKET_QR].get(&e.txn, &kp)? {
-                return Ok(v_packet_qr_decode(v));
-            }
-        }
-        Ok(None)
+        self.epoch_get(EPOCH_PACKET_QR, &kp, v_packet_qr_decode)
     }
 
     /// CONN_STATE 点查（连接热状态，live 库）。
@@ -282,6 +345,7 @@ impl QuerySession {
     /// 跨 epoch 原始键级扫描：epoch 序号升序 + 库内主键序（§13.9.4 确定性排序）。
     /// 游标格式 = `[epoch_num:u32 BE][key]`（跨 epoch 排他续读；None = 首页）。
     /// 返回 `(epoch_num, key, value)` 三元组（上限 limit 条）。
+    /// L2：扫到哪个 epoch 才 open（当前 epoch 用快照，历史惰性重开），扫完即 drop。
     fn page_rows_epochs(
         &self,
         db_idx: usize,
@@ -294,42 +358,56 @@ impl QuerySession {
         let (cur_epoch, cur_key) = parse_cursor(&page.cursor);
 
         // 前向：从 cursor.epoch（排他 key）开始升序。
-        let forward_epochs: Vec<&OpenedEpoch> = if page.forward {
-            self.epochs.iter().filter(|e| e.num >= cur_epoch).collect()
+        let forward_epochs: Vec<&EpochTarget> = if page.forward {
+            self.targets.iter().filter(|t| t.num >= cur_epoch).collect()
         } else {
-            self.epochs.iter().rev().filter(|e| e.num <= cur_epoch).collect()
+            self.targets
+                .iter()
+                .rev()
+                .filter(|t| t.num <= cur_epoch)
+                .collect()
         };
 
-        for e in forward_epochs {
+        for t in forward_epochs {
             // 当前页起点：cursor 落在本 epoch → 从 cursor.key 之后；否则从区间头/尾。
-            if page.forward {
-                let start: Bound<&[u8]> = if e.num == cur_epoch && page.cursor.is_some() {
-                    let Some(k) = &cur_key else { unreachable!() };
-                    Bound::Excluded(k.as_slice())
+            let cursor_key: Option<&[u8]> =
+                if t.num == cur_epoch && page.cursor.is_some() {
+                    cur_key.as_deref()
                 } else {
-                    Bound::Included(lo.as_slice())
+                    None
                 };
-                for item in e.dbs[db_idx].range(&e.txn, &(start, Bound::Included(hi.as_slice())))? {
-                    let (k, v) = item?;
-                    out.push((e.num, k.to_vec(), v.to_vec()));
-                    if out.len() >= limit {
-                        return Ok(out);
-                    }
-                }
+            let done = if t.is_current {
+                scan_epoch_range(
+                    &self.cur_txn,
+                    &self.cur_dbs,
+                    db_idx,
+                    &lo,
+                    &hi,
+                    t.num,
+                    cursor_key,
+                    page.forward,
+                    limit,
+                    &mut out,
+                )?
             } else {
-                let end: Bound<&[u8]> = if e.num == cur_epoch && page.cursor.is_some() {
-                    let Some(k) = &cur_key else { unreachable!() };
-                    Bound::Excluded(k.as_slice())
-                } else {
-                    Bound::Included(hi.as_slice())
-                };
-                for item in e.dbs[db_idx].rev_range(&e.txn, &(Bound::Included(lo.as_slice()), end))? {
-                    let (k, v) = item?;
-                    out.push((e.num, k.to_vec(), v.to_vec()));
-                    if out.len() >= limit {
-                        return Ok(out);
-                    }
-                }
+                let o = self.open_epoch(t.num, &t.dir)?;
+                let done = scan_epoch_range(
+                    &o.txn,
+                    &o.dbs,
+                    db_idx,
+                    &lo,
+                    &hi,
+                    t.num,
+                    cursor_key,
+                    page.forward,
+                    limit,
+                    &mut out,
+                )?;
+                drop(o);
+                done
+            };
+            if done {
+                return Ok(out);
             }
         }
         Ok(out)
@@ -367,6 +445,9 @@ fn parse_cursor(cursor: &Option<Vec<u8>>) -> (u32, Option<Vec<u8>>) {
 
 /// 原始键级扫描行：(epoch_num, key, value)。
 type RawEpochRow = (u32, Vec<u8>, Vec<u8>);
+
+/// 单 epoch 范围扫描迭代器（range/rev_range 统一盒化后的流；借用 txn，非 'static）。
+type RawEpochStream<'a> = Box<dyn Iterator<Item = Result<(Vec<u8>, Vec<u8>)>> + 'a>;
 
 /// 导出接口：逐行喂给 sink，由实现决定输出格式（JSONL/CSV/Parquet）。
 pub trait ExportSink {
@@ -448,6 +529,95 @@ pub fn stream_records<S: ExportSink>(
 
 // --- 内部：键区间构造 + 原始分页扫描 ---
 
+/// 单 epoch 内 range/rev_range 扫描（当前 epoch 快照 txn 或惰性重开 txn 通用）。
+/// 游标落在本 epoch 时排他续读；返回「是否已达 limit」。
+#[allow(clippy::too_many_arguments)] // 原始扫描参数位，扁平直白。
+fn scan_epoch_range(
+    txn: &heed::RoTxn<'static, heed::WithTls>,
+    dbs: &[Database<Bytes, Bytes>; NUM_EPOCH_DBIS],
+    db_idx: usize,
+    lo: &[u8],
+    hi: &[u8],
+    epoch_num: u32,
+    cursor_key: Option<&[u8]>,
+    forward: bool,
+    limit: usize,
+    out: &mut Vec<RawEpochRow>,
+) -> Result<bool> {
+    let (start, end) = if forward {
+        let start: Bound<&[u8]> = match cursor_key {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Included(lo),
+        };
+        (start, Bound::Included(hi))
+    } else {
+        let end: Bound<&[u8]> = match cursor_key {
+            Some(k) => Bound::Excluded(k),
+            None => Bound::Included(hi),
+        };
+        (Bound::Included(lo), end)
+    };
+    // range / rev_range 迭代器类型不同，统一盒化为 `Result<(Vec<u8>, Vec<u8>)>` 流。
+    let items: RawEpochStream<'_> = if forward {
+        Box::new(
+            dbs[db_idx]
+                .range(txn, &(start, end))?
+                .map(|x| x.map(|(k, v)| (k.to_vec(), v.to_vec())).map_err(Into::into)),
+        )
+    } else {
+        Box::new(
+            dbs[db_idx]
+                .rev_range(txn, &(start, end))?
+                .map(|x| x.map(|(k, v)| (k.to_vec(), v.to_vec())).map_err(Into::into)),
+        )
+    };
+    for item in items {
+        let (k, v) = item?;
+        out.push((epoch_num, k, v));
+        if out.len() >= limit {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// L1：按 `[start_ts, end_ts]` 裁剪 epoch 候选集。
+/// - 无时间窗 → 全保留；
+/// - 当前 epoch（max_ts 未知）→ 恒保留；
+/// - 无边界行（旧库/未轮转冻结）→ 保留（正确性优先，宁可多扫）；
+/// - 否则按 [min_ts, max_ts] 与窗口是否重叠判定。
+fn prune_targets_by_window(
+    targets: Vec<EpochTarget>,
+    ledger: &Ledger,
+    start_ts: Option<u64>,
+    end_ts: Option<u64>,
+) -> Result<Vec<EpochTarget>> {
+    if start_ts.is_none() && end_ts.is_none() {
+        return Ok(targets);
+    }
+    let boundaries: HashMap<i64, EpochBoundary> = ledger
+        .epoch_boundaries()?
+        .into_iter()
+        .map(|b| (b.epoch_id, b))
+        .collect();
+    let s = start_ts.unwrap_or(0);
+    let e = end_ts.unwrap_or(u64::MAX);
+    Ok(targets
+        .into_iter()
+        .filter(|t| {
+            if t.is_current {
+                return true;
+            }
+            let Some(b) = boundaries.get(&(t.num as i64)) else {
+                return true;
+            };
+            let bmin = b.min_ts.map(|v| v as u64).unwrap_or(0);
+            let bmax = b.max_ts.map(|v| v as u64).unwrap_or(u64::MAX);
+            !(bmax < s || bmin > e)
+        })
+        .collect())
+}
+
 /// CONN_QR 区间：[conn][start_ts][0] .. [conn][end_ts][0xFF]，24B。
 fn conn_qr_bounds(conn_hash: u64, start_ts: Option<u64>, end_ts: Option<u64>) -> (Vec<u8>, Vec<u8>) {
     let mut lo = Vec::with_capacity(24);
@@ -470,12 +640,6 @@ fn ts_bounds(start_ts: Option<u64>, end_ts: Option<u64>) -> (Vec<u8>, Vec<u8>) {
     hi.extend_from_slice(&end_ts.unwrap_or(u64::MAX).to_be_bytes());
     hi.extend_from_slice(&[0xFFu8; 8]);
     (lo, hi)
-}
-
-/// 从目录名提取 epoch 序号：`epoch_0003` → 3。
-fn epoch_num_of(dir: &Path) -> Option<u32> {
-    let name = dir.file_name()?.to_str()?;
-    name.strip_prefix("epoch_")?.parse().ok()
 }
 
 #[inline]
@@ -744,6 +908,64 @@ mod tests {
         let f = RecordFilter { start_ts: Some(base + 50), end_ts: None };
         let n = stream_records(&reg, &f, &mut sink).unwrap();
         assert_eq!(n, 2); // udp1 + udp2
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// L1：时间窗裁剪只命中 epoch 子集——历史边界索引 + 惰性打开正确性。
+    #[test]
+    fn window_pruning_skips_non_overlapping_epochs() {
+        use crate::ledger::{EpochBoundary, EpochState, Ledger};
+        let dir = tmpdir("prune");
+        let root = dir.join("qridx");
+        let mut reg = DbRegistry::open(&root, 16 * 1024 * 1024).unwrap();
+        let ledger = Ledger::open(&dir.join("ledger.db")).unwrap();
+        let base = 1_700_000_000_000_000_000u64;
+
+        // epoch_0000：写种子（ts ∈ [base, base+60]）→ 冻结边界 → 轮转。
+        seed(&reg);
+        let (min0, max0, cnt0) = reg.current_epoch_bounds().unwrap();
+        assert_eq!(min0, Some(base));
+        ledger
+            .upsert_epoch_boundary(&EpochBoundary {
+                epoch_id: 0,
+                dir: "epoch_0000".into(),
+                min_ts: min0.map(|v| v as i64),
+                max_ts: max0.map(|v| v as i64),
+                record_count: cnt0 as i64,
+                state: EpochState::Frozen,
+            })
+            .unwrap();
+        reg.rotate_epoch().unwrap();
+
+        // epoch_0001（当前）：再写一批（同一批 ts，仅验证当前 epoch 恒不裁剪）。
+        seed(&reg);
+
+        // 窗口落在 epoch_0001 → epoch_0000 裁剪，只剩当前。
+        let s =
+            QuerySession::open_with_window(&reg, &ledger, Some(base + 70), Some(base + 90))
+                .unwrap();
+        assert_eq!(s.targets.len(), 1, "非命中历史 epoch 应被裁剪");
+        assert_eq!(s.targets[0].num, 1);
+        assert!(s.targets[0].is_current);
+        drop(s); // 会话持有 static 只读事务，同线程并发开第二个会 MDB_BAD_RSLOT，先释放。
+
+        // 窗口命中 epoch_0000 → 历史保留（全量 2）。
+        let s = QuerySession::open_with_window(&reg, &ledger, Some(base), Some(base + 10)).unwrap();
+        assert_eq!(s.targets.len(), 2, "命中 epoch_0000 → 历史保留");
+        assert_eq!(s.targets[0].num, 0);
+        assert_eq!(s.targets[1].num, 1);
+        drop(s);
+
+        // 无窗口 → 全保留。
+        let s = QuerySession::open(&reg).unwrap();
+        assert_eq!(s.targets.len(), 2);
+        drop(s);
+
+        // 裁剪后的会话仍能正确翻页/点查（epoch_0000 不在候选内，读不到其数据 → 结果只含 epoch_0001）。
+        let s = QuerySession::open_with_window(&reg, &ledger, Some(base + 70), Some(base + 90)).unwrap();
+        let f = RecordFilter { start_ts: Some(base + 70), end_ts: None };
+        let r = s.scan_records(&f, &Page::default()).unwrap();
+        assert!(r.rows.is_empty(), "窗口外无数据");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
