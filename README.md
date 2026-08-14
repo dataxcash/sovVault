@@ -195,4 +195,4 @@ doc/               # design & implementation specs (EN + 中文)
 
 ## License
 
-[Apache-2.0](LICENSE)
+[AGPL-3.0](LICENSE)

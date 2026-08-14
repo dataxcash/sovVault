@@ -3,7 +3,7 @@ name = "sov-vault"
 version = "0.1.0"
 edition = "2021"
 description = "铁幕·带外零信任主权平台 - 存储中枢 (sovVault)"
-license = "Apache-2.0"
+license = "AGPL-3.0"
 
 [[bin]]
 name = "sovvault"
